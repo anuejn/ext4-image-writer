@@ -1,0 +1,9 @@
+[package]
+name = "ext4-writer"
+description = "A simple ext4 image writing library"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+binrw = "0.15.0"
+crc32c = "0.6.8"
