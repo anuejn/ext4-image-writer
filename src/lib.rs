@@ -1,10 +1,10 @@
-use crate::ext4_h::*;
-use binrw::{BinResult, BinWrite};
-use std::io::{self, Cursor};
+use crate::{ext4_h::*, serialization::Buffer};
+use std::io::{self, Cursor, Write};
 
 #[allow(dead_code)]
 mod ext4_h;
-mod serdes;
+#[macro_use]
+mod serialization;
 
 const BLOCK_SIZE: u64 = 4096;
 const BLOCK_GROUP_SIZE: u64 = BLOCK_SIZE * BLOCK_SIZE * 8;
@@ -45,18 +45,15 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         }
     }
 
-    pub fn write_file(&mut self, path: &str, data: &[u8]) -> BinResult<()> {
+    pub fn write_file(&mut self, path: &str, data: &[u8]) -> io::Result<()> {
         let start_block = self.write_blocks_alloc(data)?;
         let inode = Ext4Inode::new(data.len() as u64, start_block);
         self.inodes.push(inode);
         Ok(())
     }
 
-    pub fn finalize(mut self) -> BinResult<()> {
-        let mut first_block = Cursor::new([0u8; BLOCK_SIZE as usize]);
-        let superblock = ext4_h::Ext4SuperBlock::new();
-        superblock.write_le(&mut first_block)?;
-        self.writer.write_block(1, &first_block.into_inner())?;
+    pub fn finalize(mut self) -> io::Result<()> {
+        let mut superblock = ext4_h::Ext4SuperBlock::new();
 
         // we now analyze what we have written and build block group descriptors for each block group.
         let mut bgdt_buf = Cursor::new(Vec::new());
@@ -67,8 +64,12 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
             let block_bitmap = BitmapBlock::new(4096);
             let inode_bitmap = BitmapBlock::new(superblock.inodes_per_group());
 
-            let mut inode_buf = Cursor::new(vec![0u8; superblock.inodes_per_group() as usize * INODE_SIZE as usize]);
-            while let Some(inode) = self.inodes.pop() {
+            let mut inode_buf = Cursor::new(vec![
+                0u8;
+                superblock.inodes_per_group() as usize
+                    * INODE_SIZE as usize
+            ]);
+            while let Some(mut inode) = self.inodes.pop() {
                 inode_num += 1;
                 let block_group = inode.block_group();
                 let max_bgdt_table_len = self.max_size.div_ceil(BLOCK_SIZE * BLOCK_SIZE * 8) as u32;
@@ -79,29 +80,35 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
                     self.inodes.push(inode); // put it back for the next block group
                     break; // we are done with this block group
                 }
-                inode.with_checksum(superblock.uuid(), inode_num).write_le(&mut inode_buf)?;
+                inode.update_checksum(superblock.uuid(), inode_num);
+                inode_buf.write_all(&inode.as_buffer())?;
             }
 
             // write out the inode table for this block group
-            let block_bitmap_block = self.write_blocks_alloc(&binwrite_as_buf(&block_bitmap)?)?; // TODO: actually build a bitmap
-            let inode_bitmap_block = self.write_blocks_alloc(&binwrite_as_buf(&inode_bitmap)?)?;
+            let block_bitmap_block = self.write_blocks_alloc(&block_bitmap.as_buffer())?;
+            let inode_bitmap_block = self.write_blocks_alloc(&inode_bitmap.as_buffer())?;
             let inode_block = self.write_blocks_alloc(&inode_buf.into_inner())?;
-            let block_group_descriptor = Ext4BlockGroupDescriptor::default()
-                .with_block_bitmap(block_bitmap_block)
-                .with_inode_bitmap(inode_bitmap_block)
-                .with_inode_table(inode_block);
-            block_group_descriptor.with_checksums(superblock.uuid(), last_block_group, &block_bitmap, &inode_bitmap).write_le(&mut bgdt_buf)?;
+            let mut block_group_descriptor = Ext4BlockGroupDescriptor::default();
+            block_group_descriptor.set_block_bitmap(block_bitmap_block);
+            block_group_descriptor.set_inode_bitmap(inode_bitmap_block);
+            block_group_descriptor.set_inode_table(inode_block);
+            block_group_descriptor.update_checksums(
+                superblock.uuid(),
+                last_block_group,
+                &block_bitmap,
+                &inode_bitmap,
+            );
+            bgdt_buf.write_all(&block_group_descriptor.as_buffer())?;
             last_block_group += 1;
         }
         self.writer.write_block(1, &bgdt_buf.into_inner())?;
 
         // finally write the superblock
-        let mut superblock_buf = Cursor::new([0u8; BLOCK_SIZE as usize]);
-        superblock_buf.set_position(1024);
-        let superblock = ext4_h::Ext4SuperBlock::new()
-            .with_blocks_count(self.next_free_block);
-        superblock.write_le(&mut superblock_buf)?;
-        self.writer.write_block(0, &superblock_buf.into_inner())?;
+        superblock.update_blocks_count(self.next_free_block);
+        superblock.update_checksum();
+        let mut first_block = [0u8; BLOCK_SIZE as usize];
+        first_block[1024..1024 + 1024].copy_from_slice(&superblock.as_buffer());
+        self.writer.write_block(0, &first_block)?;
 
         Ok(())
     }
@@ -112,7 +119,7 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         start
     }
 
-    fn write_blocks(&mut self, start_block: u64, data: &[u8]) -> BinResult<()> {
+    fn write_blocks(&mut self, start_block: u64, data: &[u8]) -> io::Result<()> {
         let mut offset = 0;
         let mut block_num = start_block;
         while offset < data.len() {
@@ -126,7 +133,7 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         Ok(())
     }
 
-    fn write_blocks_alloc(&mut self, data: &[u8]) -> BinResult<u64> {
+    fn write_blocks_alloc(&mut self, data: &[u8]) -> io::Result<u64> {
         let num_blocks = (data.len() as u64).div_ceil(BLOCK_SIZE);
         let start_block = self.alloc_blocks(num_blocks);
         self.write_blocks(start_block, data)?;
