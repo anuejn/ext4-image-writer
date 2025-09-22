@@ -1,6 +1,8 @@
 use std::{fmt::Debug, io};
 
 pub trait Buffer<const N: usize> {
+    const SIZE: u64 = N as u64;
+
     fn read_buffer(buf: &[u8]) -> Self;
     fn write_buffer(&self, buf: &mut [u8]);
 
@@ -82,6 +84,7 @@ macro_rules! impl_buffer_for_u32_array {
 }
 impl_buffer_for_u32_array!(2);
 impl_buffer_for_u32_array!(4);
+impl_buffer_for_u32_array!(12);
 impl_buffer_for_u32_array!(17);
 
 #[derive(Clone, PartialEq, Eq)]
