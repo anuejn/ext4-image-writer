@@ -3,10 +3,11 @@ use std::{fmt::Debug, io};
 pub trait Buffer<const N: usize> {
     const SIZE: u64 = N as u64;
 
+    #[allow(dead_code)]
     fn read_buffer(buf: &[u8]) -> Self;
     fn write_buffer(&self, buf: &mut [u8]);
 
-    fn as_buffer(&self) -> [u8; N] {
+    fn as_bytes(&self) -> [u8; N] {
         let mut buf = [0u8; N];
         self.write_buffer(&mut buf);
         buf
@@ -86,13 +87,44 @@ impl_buffer_for_u32_array!(2);
 impl_buffer_for_u32_array!(4);
 impl_buffer_for_u32_array!(12);
 impl_buffer_for_u32_array!(17);
+impl_buffer_for_u32_array!(1024);
+
+macro_rules! impl_buffer_for_u64_array {
+    ($n:expr) => {
+        impl Buffer<{ $n * 8 }> for [u64; $n] {
+            fn read_buffer(buf: &[u8]) -> Self {
+                let mut arr = [0u64; $n];
+                for i in 0..$n {
+                    arr[i] = u64::from_le_bytes([
+                        buf[i * 8],
+                        buf[i * 8 + 1],
+                        buf[i * 8 + 2],
+                        buf[i * 8 + 3],
+                        buf[i * 8 + 4],
+                        buf[i * 8 + 5],
+                        buf[i * 8 + 6],
+                        buf[i * 8 + 7],
+                    ]);
+                }
+                arr
+            }
+            fn write_buffer(&self, buf: &mut [u8]) {
+                for i in 0..$n {
+                    let bytes = self[i].to_le_bytes();
+                    buf[i * 8..i * 8 + 8].copy_from_slice(&bytes);
+                }
+            }
+        }
+    };
+}
+impl_buffer_for_u64_array!(512);
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct StaticLenString<const N: usize> {
     pub data: [u8; N],
 }
 impl<const N: usize> StaticLenString<N> {
-    #[allow(unused)]
+    #[cfg(test)]
     pub fn from_str(s: &str) -> Self {
         let mut data = [0u8; N];
         let bytes = s.as_bytes();
@@ -131,8 +163,8 @@ impl<const N: usize> Buffer<N> for StaticLenString<N> {
     }
 }
 
+#[allow(dead_code)]
 pub trait CheckMagic {
-    #[allow(unused)]
     fn check_magic(&self) -> io::Result<()>;
 }
 
@@ -198,10 +230,11 @@ pub(crate) use ext4_struct;
 
 macro_rules! hi_lo_field_u64 {
     ($get_name:ident, $set_name:ident, $hi:ident, $lo:ident) => {
+        #[allow(dead_code)]
         pub fn $get_name(&self) -> u64 {
             ((self.$hi as u64) << 32) | (self.$lo as u64)
         }
-
+        #[allow(dead_code)]
         pub fn $set_name(&mut self, value: u64) {
             self.$hi = (value >> 32) as u32;
             self.$lo = (value & 0xFFFFFFFF) as u32;
@@ -212,10 +245,11 @@ pub(crate) use hi_lo_field_u64;
 
 macro_rules! hi_lo_field_u32 {
     ($get_name:ident, $set_name:ident, $hi:ident, $lo:ident) => {
+        #[allow(dead_code)]
         pub fn $get_name(&self) -> u32 {
             ((self.$hi as u32) << 16) | (self.$lo as u32)
         }
-
+        #[allow(dead_code)]
         pub fn $set_name(&mut self, value: u32) {
             self.$hi = (value >> 16) as u16;
             self.$lo = (value & 0xFFFF) as u16;
@@ -226,10 +260,11 @@ pub(crate) use hi_lo_field_u32;
 
 macro_rules! hi_lo_field_u48 {
     ($get_name:ident, $set_name:ident, $hi:ident, $lo:ident) => {
+        #[allow(dead_code)]
         pub fn $get_name(&self) -> u64 {
             ((self.$hi as u64) << 32) | (self.$lo as u64)
         }
-
+        #[allow(dead_code)]
         pub fn $set_name(&mut self, value: u64) {
             self.$hi = (value >> 32) as u16;
             self.$lo = (value & 0xFFFFFFFF) as u32;

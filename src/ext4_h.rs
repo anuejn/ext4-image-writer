@@ -1,8 +1,9 @@
-use crate::BLOCK_SIZE;
 use crate::serialization::{
     Buffer, StaticLenString, ext4_struct, hi_lo_field_u32, hi_lo_field_u48, hi_lo_field_u64,
 };
+use crate::{Allocation, BLOCK_SIZE};
 use std::fmt::Debug;
+use std::vec;
 
 macro_rules! calculate_checksum {
     ($($item:expr),*) => {
@@ -148,11 +149,11 @@ ext4_struct! { Ext4SuperBlock {
     s_checksum: u32, /* crc32c(superblock) */
 }}
 impl Ext4SuperBlock {
-    pub fn new() -> Self {
+    pub fn new(uuid: [u8; 16], inodes_per_group: u32) -> Self {
         Ext4SuperBlock {
             s_blocks_per_group: 32768,
             s_clusters_per_group: 32768,
-            s_inodes_per_group: 4096,
+            s_inodes_per_group: inodes_per_group,
             s_mtime: 0,
             s_wtime: 1758215058,
             s_mnt_count: 0,
@@ -172,9 +173,7 @@ impl Ext4SuperBlock {
             s_feature_compat: 56,
             s_feature_incompat: 706,
             s_feature_ro_compat: 1131,
-            s_uuid: [
-                213, 16, 84, 194, 97, 81, 76, 249, 133, 76, 213, 80, 197, 85, 78, 104,
-            ],
+            s_uuid: uuid,
             s_hash_seed: [940062939, 3880703204, 772543626, 1391354066],
             s_def_hash_version: 1,
             s_default_mount_opts: 12,
@@ -195,33 +194,42 @@ impl Ext4SuperBlock {
         s_blocks_count_hi,
         s_blocks_count_lo
     );
+    hi_lo_field_u64!(
+        free_blocks_count,
+        set_free_blocks_count,
+        s_free_blocks_count_hi,
+        s_free_blocks_count_lo
+    );
+    pub fn set_free_inodes_count(&mut self, count: u32) {
+        self.s_free_inodes_count = count;
+    }
 
     pub fn set_reserved_gdt_blocks(&mut self, count: u16) {
         self.s_reserved_gdt_blocks = count;
     }
 
-    pub fn update_blocks_count(&mut self, count: u64, inodes_used: u32) {
+    pub fn update_blocks_count(&mut self, count: u64) {
         self.set_blocks_count(count);
         self.s_inodes_count = self.block_groups_count() * self.inodes_per_group();
-        self.s_free_inodes_count = self.s_inodes_count - inodes_used;
     }
 
     pub fn inodes_per_group(&self) -> u32 {
-        self.s_inodes_per_group as u32
+        self.s_inodes_per_group
     }
 
     pub fn block_groups_count(&self) -> u32 {
         let blocks_count = self.blocks_count() as u32;
-        let blocks_per_group = self.s_blocks_per_group as u32;
+        let blocks_per_group = self.s_blocks_per_group;
         blocks_count.div_ceil(blocks_per_group)
     }
 
+    #[cfg(test)]
     pub fn uuid(&self) -> &[u8; 16] {
         &self.s_uuid
     }
 
     pub fn update_checksum(&mut self) {
-        self.s_checksum = calculate_checksum![&self.as_buffer()[0..1020]];
+        self.s_checksum = calculate_checksum![&self.as_bytes()[0..1020]];
     }
 }
 
@@ -281,6 +289,24 @@ impl Ext4BlockGroupDescriptor {
         bg_inode_bitmap_csum_hi,
         bg_inode_bitmap_csum_lo
     );
+    hi_lo_field_u32!(
+        free_blocks_count,
+        set_free_blocks_count,
+        bg_free_blocks_count_hi,
+        bg_free_blocks_count_lo
+    );
+    hi_lo_field_u32!(
+        free_inodes_count,
+        set_free_inodes_count,
+        bg_free_inodes_count_hi,
+        bg_free_inodes_count_lo
+    );
+    hi_lo_field_u32!(
+        used_dirs_count,
+        set_used_dirs_count,
+        bg_used_dirs_count_hi,
+        bg_used_dirs_count_lo
+    );
 
     pub fn update_checksums(
         &mut self,
@@ -294,7 +320,7 @@ impl Ext4BlockGroupDescriptor {
             uuid,
             &inode_bitmap.data[0..inode_bitmap.len.div_ceil(8) as usize]
         ]);
-        self.bg_checksum = calculate_checksum!(uuid, &n.to_le_bytes(), &self.as_buffer()) as u16;
+        self.bg_checksum = calculate_checksum!(uuid, &n.to_le_bytes(), &self.as_bytes()) as u16;
     }
 }
 
@@ -302,25 +328,65 @@ pub struct BitmapBlock {
     data: [u8; 4096],
     len: u32,
 }
-
 impl BitmapBlock {
-    pub fn new(len: u32) -> Self {
-        BitmapBlock {
+    pub fn from_bytes(data: &[u8], len: u32) -> Self {
+        let mut block = BitmapBlock {
             data: [0u8; 4096],
             len,
+        };
+        block.data[0..data.len()].copy_from_slice(data);
+        for i in len..(4096 * 8) {
+            block.set_bit(i);
         }
+        block
     }
     pub fn set_bit(&mut self, n: u32) {
         let byte = (n / 8) as usize;
         let bit = n % 8;
         self.data[byte] |= 1 << bit;
     }
+    pub fn free_count(&self) -> u32 {
+        let mut count = 0;
+        for i in 0..self.len {
+            let byte = (i / 8) as usize;
+            let bit = i % 8;
+            if (self.data[byte] & (1 << bit)) == 0 {
+                count += 1;
+            }
+        }
+        count
+    }
+}
+impl Debug for BitmapBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BitmapBlock {{\n    ")?;
+        for i in 0..self.len {
+            let byte = (i / 8) as usize;
+            let bit = i % 8;
+            if (self.data[byte] & (1 << bit)) != 0 {
+                write!(f, "1")?;
+            } else {
+                write!(f, "0")?;
+            }
+            if i % 8 == 7 {
+                write!(f, " ")?;
+            }
+            if i % 128 == 127 {
+                writeln!(f)?;
+                if i != self.len - 1 {
+                    write!(f, "    ")?;
+                }
+            }
+        }
+        writeln!(f, "}}")?;
+        Ok(())
+    }
 }
 impl Buffer<4096> for BitmapBlock {
     fn read_buffer(buf: &[u8]) -> Self {
         let mut data = [0u8; 4096];
         data.copy_from_slice(&buf[0..4096]);
-        BitmapBlock { data, len: 0 }
+        BitmapBlock { data, len: 4096 }
     }
 
     fn write_buffer(&self, buf: &mut [u8]) {
@@ -364,19 +430,26 @@ ext4_struct! { Ext4Inode {
     rest: Ext4InodeRest,
 } }
 impl Ext4Inode {
-    pub fn new(size: u64, offset: u64) -> Self {
+    pub fn new(size: u64, allocation: Allocation, ty: FileType) -> Self {
         let mut inode = Ext4Inode::default();
-        inode.set_file_type(FileType::RegularFile);
+        inode.set_file_type(ty);
         inode.i_links_count = 1;
         inode.set_size(size);
         let blocks = size.div_ceil(BLOCK_SIZE);
         inode.set_blocks(blocks);
-        Ext4SingleExtent::new(offset, blocks as u16).write_buffer(&mut inode.i_block);
+        Ext4SingleExtent::new(allocation).write_buffer(&mut inode.i_block);
+        inode.i_flags = 0x80000; // EXT4_EXTENTS_FLAG
         inode
     }
     hi_lo_field_u64!(size, set_size, i_size_high, i_size_lo);
     hi_lo_field_u48!(blocks, set_blocks, i_blocks_high, i_blocks_lo);
     hi_lo_field_u32!(checksum, set_checksum, i_checksum_hi, i_checksum_lo);
+
+    pub fn update_size(&mut self, size: u64) {
+        self.set_size(size);
+        let blocks = size.div_ceil(BLOCK_SIZE);
+        self.set_blocks(blocks * 8); // TODO: is this correct?
+    }
 
     pub fn update_checksum(&mut self, uuid: &[u8; 16], n: u32) {
         self.set_checksum(0);
@@ -384,7 +457,7 @@ impl Ext4Inode {
             uuid,
             &n.to_le_bytes(),
             &self.i_generation.to_le_bytes(),
-            &self.as_buffer()
+            &self.as_bytes()
         ]);
         let ext4_inode_csum_hi_extra_end = 18;
         let has_hi = self.i_extra_isize >= ext4_inode_csum_hi_extra_end;
@@ -400,22 +473,49 @@ impl Ext4Inode {
         self.i_links_count = count
     }
     pub fn set_mode(&mut self, mode: u16) {
-        self.i_mode = mode
+        self.i_mode = (self.i_mode & 0xf000) | (mode & 0x0fff);
     }
     pub fn set_file_type(&mut self, file_type: FileType) {
-        self.i_mode = (self.i_mode & 0x0fff) | (file_type as u16);
+        self.i_mode = (self.i_mode & 0x0fff) | file_type.as_mode();
+    }
+    pub fn is_directory(&self) -> bool {
+        (self.i_mode & 0xf000) == FileType::Directory.as_mode()
     }
 }
 
-#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
-    FIFO = 0x1000,            // S_IFIFO
-    CharacterDevice = 0x2000, // S_IFCHR
-    Directory = 0x4000,       // S_IFDIR
-    BlockDevice = 0x6000,     // S_IFBLK
-    RegularFile = 0x8000,     // S_IFREG
-    SymbolicLink = 0xA000,    // S_IFLNK
-    Socket = 0xC000,          // S_IFSOCK
+    Fifo,
+    CharacterDevice,
+    Directory,
+    BlockDevice,
+    RegularFile,
+    SymbolicLink,
+    Socket,
+}
+impl FileType {
+    pub fn as_mode(&self) -> u16 {
+        match self {
+            FileType::Fifo => 0x1000,            // S_IFifo
+            FileType::CharacterDevice => 0x2000, // S_IFCHR
+            FileType::Directory => 0x4000,       // S_IFDIR
+            FileType::BlockDevice => 0x6000,     // S_IFBLK
+            FileType::RegularFile => 0x8000,     // S_IFREG
+            FileType::SymbolicLink => 0xA000,    // S_IFLNK
+            FileType::Socket => 0xC000,          // S_IFSOCK
+        }
+    }
+    pub fn as_directory_entry_type(&self) -> u8 {
+        match self {
+            FileType::RegularFile => 1,
+            FileType::Directory => 2,
+            FileType::CharacterDevice => 3,
+            FileType::BlockDevice => 4,
+            FileType::Fifo => 5,
+            FileType::Socket => 6,
+            FileType::SymbolicLink => 7,
+        }
+    }
 }
 
 ext4_struct! { Ext4InodeRest {
@@ -430,9 +530,16 @@ ext4_struct! { LegacyBlockDescriptor {
 }}
 impl LegacyBlockDescriptor {
     pub fn new(double_indirect: u32) -> Self {
-        let mut descr = LegacyBlockDescriptor::default();
-        descr.double_indirect = double_indirect;
-        descr
+        LegacyBlockDescriptor {
+            double_indirect,
+            ..Default::default()
+        }
+    }
+    pub fn maximum_addressable_size() -> u64 {
+        let direct = 12 * BLOCK_SIZE;
+        let indirect = (BLOCK_SIZE / 8) * BLOCK_SIZE;
+        let double_indirect = (BLOCK_SIZE / 8) * (BLOCK_SIZE / 8) * BLOCK_SIZE;
+        direct + indirect + double_indirect
     }
 }
 
@@ -443,21 +550,25 @@ ext4_struct! { Ext4SingleExtent {
     padding: StaticLenString<36>, // 36 bytes
 } }
 impl Ext4SingleExtent {
-    pub fn new(block: u64, len: u16) -> Self {
+    pub fn new(allocation: Allocation) -> Self {
         Ext4SingleExtent {
             header: Ext4ExtentHeader::default(),
-            extent: Ext4Extent::new(block, len),
+            extent: Ext4Extent::new(allocation.start, (allocation.end - allocation.start) as u16),
             padding: StaticLenString::default(),
         }
+    }
+    #[cfg(test)]
+    fn as_blocks_range(&self) -> std::ops::Range<u64> {
+        self.extent.start()..(self.extent.start() + self.extent.ee_len as u64)
     }
 }
 
 ext4_struct! { Ext4ExtentHeader {
-    eh_magic: u16 = 0, /* probably will support different formats */
-    eh_entries: u16 = 0, /* number of valid entries */
-    eh_max: u16, /* capacity of store in entries */
+    eh_magic: u16 = 0xF30A, /* probably will support different formats */
+    eh_entries: u16 = 1, /* number of valid entries */
+    eh_max: u16 = 4, /* capacity of store in entries */
     eh_depth: u16 = 0, /* has tree real underlying blocks? */
-    eh_generation: u32, /* generation of the tree */
+    eh_generation: u32 = 0, /* generation of the tree */
 } }
 
 ext4_struct! { Ext4Extent {
@@ -469,7 +580,7 @@ ext4_struct! { Ext4Extent {
 impl Ext4Extent {
     pub fn new(block: u64, len: u16) -> Self {
         Ext4Extent {
-            ee_block: block as u32,
+            ee_block: 0,
             ee_len: len,
             ee_start_lo: block as u32,
             ee_start_hi: (block >> 32) as u16,
@@ -478,23 +589,122 @@ impl Ext4Extent {
     hi_lo_field_u48!(start, set_start, ee_start_hi, ee_start_lo);
 }
 
-ext4_struct! { Ext4DirEntry {
+ext4_struct! { Ext4DirEntryMeta {
     inode: u32,			           /* Inode number */
     rec_len: u16,		           /* Directory entry length */
     name_len: u8,		           /* Name length */
     file_type: u8,		           /* See file type macros EXT4_FT_* below */
-    name: StaticLenString<255>,	   /* File name */
 } }
 
-enum DirEntryFileType {
-    Unknown = 0,
-    RegularFile = 1,
-    Directory = 2,
-    CharacterDevice = 3,
-    BlockDevice = 4,
-    FIFO = 5,
-    Socket = 6,
-    Symlink = 7,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ext4DirEntry {
+    meta: Ext4DirEntryMeta,
+    name: String,
+}
+impl Ext4DirEntry {
+    pub fn new(inode: u32, file_type: FileType, name: &str) -> Self {
+        Ext4DirEntry {
+            meta: Ext4DirEntryMeta {
+                inode,
+                rec_len: (name.len() as u16 + 8).div_ceil(4) * 4, // align to 4 bytes
+                name_len: name.len() as u8,
+                file_type: file_type.as_directory_entry_type(),
+            },
+            name: String::from(name),
+        }
+    }
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut to_return = vec![0u8; self.meta.rec_len as usize];
+        self.meta.write_buffer(&mut to_return);
+        to_return
+            [Ext4DirEntryMeta::SIZE as usize..(Ext4DirEntryMeta::SIZE as usize + self.name.len())]
+            .copy_from_slice(self.name.as_bytes());
+        to_return
+    }
+
+    #[allow(dead_code)]
+    pub fn read_buffer(buf: &[u8]) -> Self {
+        let without_name = Ext4DirEntryMeta::read_buffer(buf);
+        let name = String::from(
+            std::str::from_utf8(&buf[8..(8 + without_name.name_len as usize)]).unwrap(),
+        );
+        Ext4DirEntry {
+            meta: without_name,
+            name,
+        }
+    }
+}
+
+ext4_struct! { Ext4DirEntryTail {
+    det_reserved_zero: u32 = 0, /* Inode number, must be zero */
+    det_rec_len: u16 = 12,   /* Directory entry length */
+    det_reserved_zero2: u8 = 0, /* Name length, must be zero */
+    det_reserved_ft: u8 = 0xDE,      /* File type, must be 0xDE */
+    det_checksum: u32, /* Directory leaf block checksum. */
+} }
+
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct LinearDirectoryBlock {
+    entries: Vec<Ext4DirEntry>,
+    checksum: u32,
+}
+impl LinearDirectoryBlock {
+    pub fn update_checksum(&mut self, uuid: &[u8; 16], inode: u32, inode_generation: u32) {
+        self.checksum = calculate_checksum![
+            uuid,
+            &inode.to_le_bytes(),
+            &inode_generation.to_le_bytes(),
+            &self.as_bytes()[0..4096 - 12]
+        ];
+    }
+    pub fn fits(&self, entry: &Ext4DirEntry) -> bool {
+        self.entries
+            .iter()
+            .map(|e| e.meta.rec_len as usize)
+            .sum::<usize>()
+            + (entry.meta.rec_len as usize + Ext4DirEntryMeta::SIZE as usize)
+            + Ext4DirEntryTail::SIZE as usize
+            <= 4096
+    }
+    pub fn add_entry(&mut self, entry: Ext4DirEntry) {
+        assert!(self.fits(&entry));
+        self.entries.push(entry);
+    }
+}
+impl Buffer<4096> for LinearDirectoryBlock {
+    fn read_buffer(buf: &[u8]) -> Self {
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset < 4096 - Ext4DirEntryTail::SIZE as usize {
+            let entry = Ext4DirEntry::read_buffer(&buf[offset..]);
+            offset += entry.meta.rec_len as usize;
+            entries.push(entry);
+        }
+        let tail = Ext4DirEntryTail::read_buffer(&buf[4096 - 12..]);
+        LinearDirectoryBlock {
+            entries,
+            checksum: tail.det_checksum,
+        }
+    }
+    fn write_buffer(&self, buf: &mut [u8]) {
+        println!("Writing directory block:");
+        let mut offset = 0;
+        for (i, entry) in self.entries.iter().enumerate() {
+            let mut entry = entry.clone();
+            if i == self.entries.len() - 1 {
+                entry.meta.rec_len = (4096 - 12 - offset) as u16;
+            }
+            println!("Writing entry: {i}: {:?}", entry);
+            let entry_bytes = entry.as_bytes();
+            buf[offset..(offset + entry_bytes.len())].copy_from_slice(&entry_bytes);
+            offset += entry_bytes.len();
+        }
+        let tail = Ext4DirEntryTail {
+            det_checksum: self.checksum,
+            ..Default::default()
+        };
+        tail.write_buffer(&mut buf[4096 - 12..]);
+    }
 }
 
 #[cfg(test)]
@@ -513,7 +723,7 @@ mod tests {
         ($test_name:ident, $item:expr, $size:expr) => {
             #[test]
             fn $test_name() {
-                let bytes = $item.as_buffer();
+                let bytes = $item.as_bytes();
                 assert_eq!(bytes.len(), $size);
             }
         };
@@ -530,9 +740,19 @@ mod tests {
         Ext4BlockGroupDescriptor::default(),
         64
     );
-    test_size_of!(test_block_bitmap_size, BitmapBlock::new(128), 4096);
+    test_size_of!(
+        test_block_bitmap_size,
+        BitmapBlock::from_bytes(&[0u8; 4096], 128),
+        4096
+    );
     test_size_of!(test_single_extent_size, Ext4SingleExtent::default(), 60);
     test_size_of!(test_inode_size, Ext4Inode::default(), 256);
+    test_size_of!(
+        test_legacy_block_descriptor_size,
+        LegacyBlockDescriptor::default(),
+        60
+    );
+    test_size_of!(test_dir_entry_tail_size, Ext4DirEntryTail::default(), 12);
 
     #[test]
     fn test_read_superblock() {
@@ -556,20 +776,74 @@ mod tests {
     }
 
     #[test]
-    fn test_read_first_inodes() {
+    fn test_read_inode_bitmap() {
+        let data = fs::read("test.img").unwrap();
+        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&data[1024..]);
+        sb.check_magic().unwrap();
+        let bgd: Ext4BlockGroupDescriptor = Ext4BlockGroupDescriptor::read_buffer(&data[4096..]);
+        let inode_bitmap_block = bgd.inode_bitmap();
+        let inode_bitmap =
+            BitmapBlock::read_buffer(&data[(inode_bitmap_block * BLOCK_SIZE) as usize..]);
+        println!("{inode_bitmap:#?}")
+    }
+
+    #[test]
+    fn test_read_resize_inode() {
         let data = fs::read("target/smoke.img").unwrap();
         let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&data[1024..]);
         sb.check_magic().unwrap();
         let bgd: Ext4BlockGroupDescriptor = Ext4BlockGroupDescriptor::read_buffer(&data[4096..]);
         let inode_table_block = bgd.inode_table();
-        for i in 1..11 {
-            let mut inode: Ext4Inode = Ext4Inode::read_buffer(
-                &data[(inode_table_block * BLOCK_SIZE + (i - 1) * 256) as usize..],
-            );
-            println!("{i}: {:#?}", inode);
-            let old_checksum = inode.checksum();
-            inode.update_checksum(sb.uuid(), i as u32);
-            assert_eq!(old_checksum, inode.checksum());
+        let resize_inode_num = 7;
+        let inode_offset = (resize_inode_num - 1) * 256;
+        let mut inode: Ext4Inode = Ext4Inode::read_buffer(
+            &data[(inode_table_block * BLOCK_SIZE + inode_offset) as usize..],
+        );
+        let old_checksum = inode.checksum();
+        inode.update_checksum(sb.uuid(), resize_inode_num as u32);
+        assert_eq!(old_checksum, inode.checksum());
+        println!("{:#?}", inode);
+        dbg!(inode.size());
+
+        let extent = LegacyBlockDescriptor::read_buffer(&inode.i_block);
+        println!("{:#?}", extent);
+        let block = extent.double_indirect;
+        let block_map = &data[((block as u64 + 0) * BLOCK_SIZE) as usize
+            ..((block as u64 + 2) * BLOCK_SIZE) as usize];
+        let block_map = <[u32; 1024]>::read_buffer(&block_map);
+        println!("Indirect: {:?}", &block_map);
+    }
+
+    #[test]
+    fn test_read_root_directory() {
+        let data = fs::read("test.img").unwrap();
+        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&data[1024..]);
+        sb.check_magic().unwrap();
+        let bgd: Ext4BlockGroupDescriptor = Ext4BlockGroupDescriptor::read_buffer(&data[4096..]);
+        let inode_table_block = bgd.inode_table();
+        let root_dir_inode_num = 2;
+        let inode_offset = (root_dir_inode_num - 1) * 256;
+        let mut inode: Ext4Inode = Ext4Inode::read_buffer(
+            &data[(inode_table_block * BLOCK_SIZE + inode_offset) as usize..],
+        );
+        println!("{:#?}", inode);
+
+        let old_checksum = inode.checksum();
+        inode.update_checksum(sb.uuid(), root_dir_inode_num as u32);
+        assert_eq!(old_checksum, inode.checksum());
+
+        let block = &inode.block_mut();
+        let extent: Ext4SingleExtent = Ext4SingleExtent::read_buffer(block);
+        println!("{:#?}", extent);
+
+        for block in extent.as_blocks_range() {
+            dbg!(block);
+            let block_data =
+                &data[(block * BLOCK_SIZE) as usize..((block + 1) * BLOCK_SIZE) as usize];
+            let mut dir_block = LinearDirectoryBlock::read_buffer(block_data);
+            let old_checksum = dir_block.checksum;
+            dir_block.update_checksum(sb.uuid(), root_dir_inode_num as u32, inode.i_generation);
+            assert_eq!(old_checksum, dir_block.checksum);
         }
     }
 }
