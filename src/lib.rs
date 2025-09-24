@@ -129,9 +129,6 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
     }
 
     pub fn finalize(mut self) -> io::Result<()> {
-        // set the resize inode
-        self.inodes[6 /*inode 7*/] = self.create_resize_inode()?;
-
         // setup the lost+found directory
         let lost_and_found_inode = self.create_directory(
             11,
@@ -152,6 +149,9 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
             ],
         )?;
         self.inodes[1 /*inode 2*/] = root_dir_inode;
+
+        // set the resize inode
+        self.inodes[6 /*inode 7*/] = self.create_resize_inode()?;
 
         // write inodes and build block group descriptors for each block group.
         let mut total_free_inodes = 0;
@@ -229,7 +229,9 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
 
         // finally write the superblock
         let mut superblock = ext4_h::Ext4SuperBlock::new(self.uuid, self.inodes_per_group);
-        superblock.set_reserved_gdt_blocks(self.bgdt_blocks() as u16);
+        let used_bgdt_blocks =
+            (self.block_groups() as u64 * Ext4BlockGroupDescriptor::SIZE).div_ceil(BLOCK_SIZE);
+        superblock.set_reserved_gdt_blocks((self.bgdt_blocks() - used_bgdt_blocks) as u16);
         superblock.set_free_inodes_count(dbg!(total_free_inodes));
         superblock.set_free_blocks_count(total_free_blocks);
         superblock.update_blocks_count(self.used_blocks.next_free);
@@ -303,7 +305,8 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         let used_bgdt_blocks =
             (block_groups as u64 * Ext4BlockGroupDescriptor::SIZE).div_ceil(BLOCK_SIZE);
 
-        let bgdt_block_list = (1 + used_bgdt_blocks)..(1 + self.bgdt_blocks());
+        dbg!(self.bgdt_blocks());
+        let bgdt_block_list = (1 + used_bgdt_blocks)..(self.bgdt_blocks() + 1);
         let mut indirect_buffer = vec![];
         indirect_buffer.extend_from_slice(&(0u32).to_le_bytes());
         for block in bgdt_block_list {
@@ -316,7 +319,7 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         let mut inode = Ext4Inode::default();
 
         descr.write_buffer(inode.block_mut());
-        inode.update_size(self.bgdt_blocks() * BLOCK_SIZE);
+        inode.update_size((self.bgdt_blocks() - used_bgdt_blocks + 1) * BLOCK_SIZE);
         inode.set_file_type(FileType::RegularFile);
         inode.set_links_count(1);
         inode.set_size(LegacyBlockDescriptor::maximum_addressable_size());
