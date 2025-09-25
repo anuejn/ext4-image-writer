@@ -434,9 +434,7 @@ impl Ext4Inode {
         let mut inode = Ext4Inode::default();
         inode.set_file_type(ty);
         inode.i_links_count = 1;
-        inode.set_size(size);
-        let blocks = size.div_ceil(BLOCK_SIZE);
-        inode.set_blocks(blocks);
+        inode.update_size(size);
         Ext4SingleExtent::new(allocation).write_buffer(&mut inode.i_block);
         inode.i_flags = 0x80000; // EXT4_EXTENTS_FLAG
         inode
@@ -483,6 +481,7 @@ impl Ext4Inode {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Fifo,
@@ -621,6 +620,9 @@ impl Ext4DirEntry {
             .copy_from_slice(self.name.as_bytes());
         to_return
     }
+    pub fn is_directory(&self) -> bool {
+        self.meta.file_type == FileType::Directory.as_directory_entry_type()
+    }
 
     #[allow(dead_code)]
     pub fn read_buffer(buf: &[u8]) -> Self {
@@ -687,14 +689,12 @@ impl Buffer<4096> for LinearDirectoryBlock {
         }
     }
     fn write_buffer(&self, buf: &mut [u8]) {
-        println!("Writing directory block:");
         let mut offset = 0;
         for (i, entry) in self.entries.iter().enumerate() {
             let mut entry = entry.clone();
             if i == self.entries.len() - 1 {
                 entry.meta.rec_len = (4096 - 12 - offset) as u16;
             }
-            println!("Writing entry: {i}: {:?}", entry);
             let entry_bytes = entry.as_bytes();
             buf[offset..(offset + entry_bytes.len())].copy_from_slice(&entry_bytes);
             offset += entry_bytes.len();
