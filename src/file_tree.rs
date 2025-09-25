@@ -17,7 +17,7 @@ impl Directory {
         }
         for (i, part) in parts.iter().enumerate() {
             let (_, entry) = current.0.iter_mut().find(|(name, _)| name == part)?;
-            if dbg!(i) == parts.len() - 1 {
+            if i == parts.len() - 1 {
                 return Some(entry);
             }
             match entry {

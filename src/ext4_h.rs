@@ -158,7 +158,7 @@ impl Ext4SuperBlock {
             s_wtime: 1758215058,
             s_mnt_count: 0,
             s_max_mnt_count: 65535,
-            s_magic: 61267,
+            s_magic: 0xef53,
             s_state: 1,
             s_errors: 1,
             s_minor_rev_level: 0,
@@ -170,13 +170,13 @@ impl Ext4SuperBlock {
             s_first_ino: 11,
             s_inode_size: 256,
             s_block_group_nr: 0,
-            s_feature_compat: 56,
-            s_feature_incompat: 706,
-            s_feature_ro_compat: 1131,
+            s_feature_compat: 0x0038 | 0x0200, /* sparse_super2 */
+            s_feature_incompat: 0x02c2,
+            s_feature_ro_compat: 0x046a,
             s_uuid: uuid,
             s_hash_seed: [940062939, 3880703204, 772543626, 1391354066],
             s_def_hash_version: 1,
-            s_default_mount_opts: 12,
+            s_default_mount_opts: 0x000c,
             s_first_meta_bg: 0,
             s_mkfs_time: 1758215058,
             s_min_extra_isize: 32,
@@ -330,6 +330,7 @@ pub struct BitmapBlock {
 }
 impl BitmapBlock {
     pub fn from_bytes(data: &[u8], len: u32) -> Self {
+        assert!(len <= 4096 * 8);
         let mut block = BitmapBlock {
             data: [0u8; 4096],
             len,

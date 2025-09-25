@@ -8,7 +8,6 @@ mod serialization;
 mod util;
 
 const BLOCK_SIZE: u64 = 4096;
-const BLOCK_GROUP_SIZE: u64 = BLOCK_SIZE * BLOCK_SIZE * 8;
 const INODE_SIZE: u64 = 256;
 
 pub trait BlockWriteDeviece {
@@ -65,12 +64,6 @@ struct Allocation {
     pub end: u64,
 }
 impl Allocation {
-    pub fn single(block: u64) -> Self {
-        Allocation {
-            start: block,
-            end: block + 1,
-        }
-    }
     pub fn from_start_len(start: u64, len: u64) -> Self {
         Allocation {
             start,
@@ -87,7 +80,6 @@ pub struct Ext4ImageWriter<W: BlockWriteDeviece> {
     writer: W,
     uuid: [u8; 16],
     max_size: u64,
-    inodes_per_group: u32,
 
     directories: Directory,
     inodes: Vec<Ext4Inode>,
@@ -106,7 +98,6 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
                 0xDE, 0xF0,
             ],
             max_size,
-            inodes_per_group: 4096,
 
             directories: Default::default(),
             inodes: Default::default(),
@@ -133,14 +124,50 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         this
     }
 
+    /// Write a file to the filesystem at the given path with the given mode.
+    /// The path must use '/' as the separator.
+    pub fn write_file(&mut self, contents: &[u8], path: &str, mode: u16) -> io::Result<()> {
+        let inode_num = self.alloc_inode();
+        let mut inode = self.create_inode_with_contents(contents, FileType::RegularFile)?;
+        inode.set_mode(mode);
+        self.inodes[(inode_num - 1) as usize] = inode;
+        self.directories.create_file(path, inode_num)?;
+        Ok(())
+    }
+
+    /// Create a directory at the given path. All parent directories must already exist.
+    /// The path must use '/' as the separator.
+    pub fn mkdir(&mut self, path: &str) -> io::Result<()> {
+        self.directories.mkdir(path)?;
+        Ok(())
+    }
+
+    /// Create a directory at the given path, creating all parent directories as needed.
+    /// The path must use '/' as the separator.
+    pub fn mkdir_p(&mut self, path: &str) -> io::Result<()> {
+        self.directories.mkdir_p(path)?;
+        Ok(())
+    }
+
     /// Write all metadata to the underlying block device and finish writhing the filesystem
     pub fn finalize(mut self) -> io::Result<()> {
-        // create inodes for all directories and write the root directory
         let directories = std::mem::take(&mut self.directories);
         self.write_hierarchy_to_inodes(&directories, 2, 2)?;
 
-        // set the resize inode
-        self.inodes[6 /*inode 7*/] = self.create_resize_inode()?;
+        let num_inodes = self.inodes.len() as u64;
+        let blocks_needed_for_inodes = (num_inodes * INODE_SIZE).div_ceil(BLOCK_SIZE);
+        let blocks_estimate = self.used_blocks.next_free + blocks_needed_for_inodes + 1 /* resize inode indirect block */ ;
+        let block_groups_estimate = blocks_estimate.div_ceil(BLOCK_SIZE * 8);
+        let blocks_estimate = blocks_estimate + block_groups_estimate * 2; // for the block and inode bitmaps;
+        let block_groups_estimate = blocks_estimate.div_ceil(BLOCK_SIZE * 8);
+        let inodes_per_group = ((num_inodes / block_groups_estimate)
+            .div_ceil(BLOCK_SIZE / INODE_SIZE)
+            * (BLOCK_SIZE / INODE_SIZE)) as usize;
+        assert!(
+            block_groups_estimate == self.inodes.len().div_ceil(inodes_per_group as usize) as u64
+        );
+
+        self.inodes[6 /*inode 7*/] = self.create_resize_inode(block_groups_estimate)?;
 
         // write inodes and build block group descriptors for each block group.
         let mut total_free_inodes = 0;
@@ -148,21 +175,14 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         let mut bgdt_buf = Cursor::new(Vec::new());
         let max_bgdt_table_len = self.max_size.div_ceil(BLOCK_SIZE * BLOCK_SIZE * 8) as u32;
         let mut inodes = std::mem::take(&mut self.inodes);
-        for (block_group, inodes) in inodes
-            .chunks_mut(self.inodes_per_group as usize)
-            .enumerate()
-        {
+        for (block_group, inodes) in inodes.chunks_mut(inodes_per_group).enumerate() {
             if block_group >= max_bgdt_table_len as usize {
                 panic!("too many block groups, try increasing the max_size parameter");
             }
-            let mut inode_buf = Cursor::new(vec![
-                0u8;
-                self.inodes_per_group as usize
-                    * INODE_SIZE as usize
-            ]);
+            let mut inode_buf = Cursor::new(vec![0u8; inodes_per_group * INODE_SIZE as usize]);
             let mut directories = 0;
             for (i, inode) in inodes.iter_mut().enumerate() {
-                let inode_num = (block_group * self.inodes_per_group as usize + i + 1) as u32;
+                let inode_num = (block_group * inodes_per_group + i + 1) as u32;
                 inode.update_checksum(&self.uuid, inode_num);
                 inode_buf.write_all(&inode.as_bytes())?;
                 if inode.is_directory() {
@@ -171,27 +191,24 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
             }
 
             // write out the inode table for this block group
-            let block_bitmap_len = if block_group == self.block_groups() as usize - 1 {
-                (self.blocks() % BLOCK_GROUP_SIZE
-                    + (self.inodes_per_group as u64 * INODE_SIZE).div_ceil(BLOCK_SIZE)
-                    + 1
-                    + 1) as u32
+            let block_bitmap_len = if block_group == block_groups_estimate as usize - 1 {
+                (blocks_estimate % (BLOCK_SIZE * 8)) as u32
             } else {
-                BLOCK_GROUP_SIZE as u32
+                (BLOCK_SIZE * 8) as u32
             };
             // we need to allocate everything first to make sure that the block bitmaps are represented in themselves
             let block_bitmap_alloc = self.used_blocks.allocate(1);
             let inode_bitmap_alloc = self.used_blocks.allocate(1);
             let inode_table_alloc = self
                 .used_blocks
-                .allocate((self.inodes_per_group as u64 * INODE_SIZE).div_ceil(BLOCK_SIZE));
+                .allocate((inodes_per_group as u64 * INODE_SIZE).div_ceil(BLOCK_SIZE));
             let block_bitmap = self
                 .used_blocks
                 .get_for_block_group(block_group as u64, block_bitmap_len);
             self.write_blocks(block_bitmap_alloc, &block_bitmap.as_bytes())?;
             let inode_bitmap = self
                 .used_inodes
-                .get_for_block_group(block_group as u64, self.inodes_per_group);
+                .get_for_block_group(block_group as u64, inodes_per_group as u32);
             self.write_blocks(inode_bitmap_alloc, &inode_bitmap.as_bytes())?;
             self.write_blocks(inode_table_alloc, &inode_buf.into_inner())?;
             let mut block_group_descriptor = Ext4BlockGroupDescriptor::default();
@@ -216,14 +233,16 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
             &bgdt_buf.into_inner(),
         )?;
 
+        assert_eq!(self.used_blocks.next_free, blocks_estimate);
+
         // finally write the superblock
-        let mut superblock = ext4_h::Ext4SuperBlock::new(self.uuid, self.inodes_per_group);
+        let mut superblock = ext4_h::Ext4SuperBlock::new(self.uuid, inodes_per_group as u32);
         let used_bgdt_blocks =
-            (self.block_groups() as u64 * Ext4BlockGroupDescriptor::SIZE).div_ceil(BLOCK_SIZE);
+            (block_groups_estimate as u64 * Ext4BlockGroupDescriptor::SIZE).div_ceil(BLOCK_SIZE);
         superblock.set_reserved_gdt_blocks((self.bgdt_blocks() - used_bgdt_blocks) as u16);
         superblock.set_free_inodes_count(total_free_inodes);
         superblock.set_free_blocks_count(total_free_blocks);
-        superblock.update_blocks_count(self.used_blocks.next_free);
+        superblock.update_blocks_count(blocks_estimate);
         superblock.update_checksum();
         let mut first_block = [0u8; BLOCK_SIZE as usize];
         first_block[1024..1024 + 1024].copy_from_slice(&superblock.as_bytes());
@@ -232,29 +251,34 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         Ok(())
     }
 
-    /// Write a file to the filesystem at the given path with the given mode.
-    /// The path must use '/' as the separator.
-    pub fn write_file(&mut self, contents: &[u8], path: &str, mode: u16) -> io::Result<()> {
-        let inode_num = self.alloc_inode();
-        let mut inode = self.create_inode_with_contents(contents, FileType::RegularFile)?;
-        inode.set_mode(mode);
-        self.inodes[(inode_num - 1) as usize] = inode;
-        self.directories.create_file(path, inode_num)?;
-        Ok(())
+    fn create_resize_inode(&mut self, block_groups: u64) -> io::Result<Ext4Inode> {
+        // this is actually not correct since when we call this function it might still happen that we modify these values
+        let used_bgdt_blocks =
+            (block_groups as u64 * Ext4BlockGroupDescriptor::SIZE).div_ceil(BLOCK_SIZE);
+
+        let bgdt_block_list = (1 + used_bgdt_blocks)..(self.bgdt_blocks() + 1);
+        let mut indirect_buffer = vec![];
+        indirect_buffer.extend_from_slice(&(0u32).to_le_bytes());
+        for block in bgdt_block_list {
+            self.used_blocks.mark_used(block);
+            indirect_buffer.extend_from_slice(&(block as u32).to_le_bytes());
+        }
+        assert!(indirect_buffer.len() <= BLOCK_SIZE as usize);
+        let block_indirect = self.write_blocks_alloc(&indirect_buffer)?;
+        let descr = LegacyBlockDescriptor::new(block_indirect.as_single() as u32);
+        let mut inode = Ext4Inode::default();
+
+        descr.write_buffer(inode.block_mut());
+        inode.update_size((self.bgdt_blocks() - used_bgdt_blocks + 1) * BLOCK_SIZE);
+        inode.set_file_type(FileType::RegularFile);
+        inode.set_links_count(1);
+        inode.set_size(LegacyBlockDescriptor::maximum_addressable_size());
+        Ok(inode)
     }
 
-    /// Create a directory at the given path. All parent directories must already exist.
-    /// The path must use '/' as the separator.
-    pub fn mkdir(&mut self, path: &str) -> io::Result<()> {
-        self.directories.mkdir(path)?;
-        Ok(())
-    }
-
-    /// Create a directory at the given path, creating all parent directories as needed.
-    /// The path must use '/' as the separator.
-    pub fn mkdir_p(&mut self, path: &str) -> io::Result<()> {
-        self.directories.mkdir_p(path)?;
-        Ok(())
+    fn bgdt_blocks(&self) -> u64 {
+        let max_bgdt_table_len = self.max_size.div_ceil(BLOCK_SIZE * BLOCK_SIZE * 8);
+        (max_bgdt_table_len * Ext4BlockGroupDescriptor::SIZE).div_ceil(BLOCK_SIZE)
     }
 
     fn write_hierarchy_to_inodes(
@@ -285,7 +309,6 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
                         } else {
                             self.alloc_inode()
                         };
-                        println!("writing {name} to inode {entry_inode_num}");
                         self.write_hierarchy_to_inodes(directory, entry_inode_num, inode_num)?;
                         Ext4DirEntry::new(entry_inode_num as u32, FileType::Directory, name)
                     }
@@ -327,17 +350,6 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         Ok(inode)
     }
 
-    /// current size in blocks of the filesystem
-    fn blocks(&self) -> u64 {
-        self.used_blocks.next_free
-    }
-
-    /// current number of block groups
-    fn block_groups(&self) -> u32 {
-        (self.blocks().div_ceil(BLOCK_SIZE) as u32)
-            .max(self.inodes.len() as u32 / self.inodes_per_group)
-    }
-
     fn create_inode_with_contents(
         &mut self,
         contents: &[u8],
@@ -353,37 +365,6 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         self.inodes.push(Ext4Inode::default());
         self.used_inodes.mark_used(n);
         n + 1
-    }
-
-    fn create_resize_inode(&mut self) -> io::Result<Ext4Inode> {
-        // this is actually not correct since when we call this function it might still happen that we modify these values
-        let block_groups = self.block_groups();
-        let used_bgdt_blocks =
-            (block_groups as u64 * Ext4BlockGroupDescriptor::SIZE).div_ceil(BLOCK_SIZE);
-
-        let bgdt_block_list = (1 + used_bgdt_blocks)..(self.bgdt_blocks() + 1);
-        let mut indirect_buffer = vec![];
-        indirect_buffer.extend_from_slice(&(0u32).to_le_bytes());
-        for block in bgdt_block_list {
-            self.used_blocks.mark_used(block);
-            indirect_buffer.extend_from_slice(&(block as u32).to_le_bytes());
-        }
-        assert!(indirect_buffer.len() <= BLOCK_SIZE as usize);
-        let block_indirect = self.write_blocks_alloc(&indirect_buffer)?;
-        let descr = LegacyBlockDescriptor::new(block_indirect.as_single() as u32);
-        let mut inode = Ext4Inode::default();
-
-        descr.write_buffer(inode.block_mut());
-        inode.update_size((self.bgdt_blocks() - used_bgdt_blocks + 1) * BLOCK_SIZE);
-        inode.set_file_type(FileType::RegularFile);
-        inode.set_links_count(1);
-        inode.set_size(LegacyBlockDescriptor::maximum_addressable_size());
-        Ok(inode)
-    }
-
-    fn bgdt_blocks(&self) -> u64 {
-        let max_bgdt_table_len = self.max_size.div_ceil(BLOCK_SIZE * BLOCK_SIZE * 8);
-        (max_bgdt_table_len * Ext4BlockGroupDescriptor::SIZE).div_ceil(BLOCK_SIZE)
     }
 
     fn write_blocks(&mut self, allocation: Allocation, data: &[u8]) -> io::Result<()> {
@@ -414,14 +395,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ext4_image_writer_smoke() {
-        let _ = std::fs::remove_file("target/smoke.img");
-        let file = std::fs::File::create("target/smoke.img").unwrap();
+    fn test_ext4_image_writer_minimal() {
+        let _ = std::fs::remove_file("target/minimal.img");
+        let file = std::fs::File::create("target/minimal.img").unwrap();
         let mut writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
         writer.mkdir("/test-dir").unwrap();
         writer
             .write_file("hello, world".as_bytes(), "test-dir/hello.txt", 0o755)
             .unwrap();
         writer.finalize().unwrap();
+        let process = std::process::Command::new("e2fsck")
+            .arg("-f")
+            .arg("-n")
+            .arg("target/smoke.img")
+            .output()
+            .unwrap();
+        assert!(process.status.success());
+    }
+
+    #[test]
+    fn test_ext4_image_writer_many_files() {
+        let _ = std::fs::remove_file("target/many_files.img");
+        let file = std::fs::File::create("target/many_files.img").unwrap();
+        let mut writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
+        for i in 0..5000 {
+            writer
+                .write_file(
+                    format!("hello, world {i}").as_bytes(),
+                    &format!("file-{i}.txt"),
+                    0o755,
+                )
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        let process = std::process::Command::new("e2fsck")
+            .arg("-f")
+            .arg("-n")
+            .arg("target/smoke.img")
+            .output()
+            .unwrap();
+        assert!(process.status.success());
     }
 }
