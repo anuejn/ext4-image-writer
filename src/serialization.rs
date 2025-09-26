@@ -22,6 +22,16 @@ impl Buffer<1> for u8 {
         buf[0] = *self;
     }
 }
+impl<const N: usize> Buffer<N> for [u8; N] {
+    fn read_buffer(buf: &[u8]) -> Self {
+        let mut arr = [0u8; N];
+        arr.copy_from_slice(&buf[0..N]);
+        arr
+    }
+    fn write_buffer(&self, buf: &mut [u8]) {
+        buf[0..N].copy_from_slice(self);
+    }
+}
 impl Buffer<2> for u16 {
     fn read_buffer(buf: &[u8]) -> Self {
         u16::from_le_bytes([buf[0], buf[1]])
@@ -49,75 +59,33 @@ impl Buffer<8> for u64 {
     }
 }
 
-impl<const N: usize> Buffer<N> for [u8; N] {
-    fn read_buffer(buf: &[u8]) -> Self {
-        let mut arr = [0u8; N];
-        arr.copy_from_slice(&buf[0..N]);
-        arr
-    }
-    fn write_buffer(&self, buf: &mut [u8]) {
-        buf[0..N].copy_from_slice(self);
-    }
-}
-macro_rules! impl_buffer_for_u32_array {
-    ($n:expr) => {
-        impl Buffer<{ $n * 4 }> for [u32; $n] {
+macro_rules! impl_buffer_for_array {
+    ($n:expr, $type:ty, $size:expr) => {
+        impl Buffer<{ $n * $size }> for [$type; $n] {
             fn read_buffer(buf: &[u8]) -> Self {
-                let mut arr = [0u32; $n];
+                let mut arr = [<$type>::default(); $n];
                 for i in 0..$n {
-                    arr[i] = u32::from_le_bytes([
-                        buf[i * 4],
-                        buf[i * 4 + 1],
-                        buf[i * 4 + 2],
-                        buf[i * 4 + 3],
-                    ]);
+                    arr[i] = <$type>::read_buffer(&buf[i * $size..]);
                 }
                 arr
             }
             fn write_buffer(&self, buf: &mut [u8]) {
                 for i in 0..$n {
-                    let bytes = self[i].to_le_bytes();
-                    buf[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+                    self[i].write_buffer(&mut buf[i * $size..]);
                 }
             }
         }
     };
 }
-impl_buffer_for_u32_array!(2);
-impl_buffer_for_u32_array!(4);
-impl_buffer_for_u32_array!(12);
-impl_buffer_for_u32_array!(17);
-impl_buffer_for_u32_array!(1024);
+pub(crate) use impl_buffer_for_array;
 
-macro_rules! impl_buffer_for_u64_array {
-    ($n:expr) => {
-        impl Buffer<{ $n * 8 }> for [u64; $n] {
-            fn read_buffer(buf: &[u8]) -> Self {
-                let mut arr = [0u64; $n];
-                for i in 0..$n {
-                    arr[i] = u64::from_le_bytes([
-                        buf[i * 8],
-                        buf[i * 8 + 1],
-                        buf[i * 8 + 2],
-                        buf[i * 8 + 3],
-                        buf[i * 8 + 4],
-                        buf[i * 8 + 5],
-                        buf[i * 8 + 6],
-                        buf[i * 8 + 7],
-                    ]);
-                }
-                arr
-            }
-            fn write_buffer(&self, buf: &mut [u8]) {
-                for i in 0..$n {
-                    let bytes = self[i].to_le_bytes();
-                    buf[i * 8..i * 8 + 8].copy_from_slice(&bytes);
-                }
-            }
-        }
-    };
-}
-impl_buffer_for_u64_array!(512);
+impl_buffer_for_array!(2, u32, 4);
+impl_buffer_for_array!(4, u32, 4);
+impl_buffer_for_array!(12, u32, 4);
+impl_buffer_for_array!(17, u32, 4);
+impl_buffer_for_array!(1024, u32, 4);
+
+impl_buffer_for_array!(512, u64, 8);
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct StaticLenString<const N: usize> {

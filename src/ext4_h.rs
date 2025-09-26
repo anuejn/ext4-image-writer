@@ -1,9 +1,9 @@
 use crate::serialization::{
     Buffer, StaticLenString, ext4_struct, hi_lo_field_u32, hi_lo_field_u48, hi_lo_field_u64,
+    impl_buffer_for_array,
 };
 use crate::{Allocation, BLOCK_SIZE};
 use std::fmt::Debug;
-use std::vec;
 
 macro_rules! calculate_checksum {
     ($($item:expr),*) => {
@@ -145,7 +145,7 @@ ext4_struct! { Ext4SuperBlock {
     s_encoding: u16,                  /* Filename charset encoding */
     s_encoding_flags: u16,            /* Filename charset encoding flags */
     s_orphan_file_inum: u32,          /* Inode for tracking orphan inodes */
-    s_reserved: StaticLenString<376>, /* Padding to the end of the block */
+    s_reserved: [u8; 376] = [0; 376], /* Padding to the end of the block */
     s_checksum: u32, /* crc32c(superblock) */
 }}
 impl Ext4SuperBlock {
@@ -428,15 +428,15 @@ ext4_struct! { Ext4Inode {
     i_crtime_extra: u32, /* extra FileCreationtime (nsec << 2 | epoch) */
     i_version_hi: u32,   /* high 32 bits for 64-bit version */
     i_projid: u32,       /* Project ID */
-    rest: Ext4InodeRest,
+    rest: [u8; 96] = [0; 96],
 } }
 impl Ext4Inode {
-    pub fn new(size: u64, allocation: Allocation, ty: FileType) -> Self {
+    pub fn new(size: u64, extents: impl Buffer<60>, ty: FileType) -> Self {
         let mut inode = Ext4Inode::default();
         inode.set_file_type(ty);
         inode.i_links_count = 1;
         inode.update_size(size);
-        Ext4SingleExtent::new(allocation).write_buffer(&mut inode.i_block);
+        extents.write_buffer(&mut inode.i_block);
         inode.i_flags = 0x80000; // EXT4_EXTENTS_FLAG
         inode
     }
@@ -518,10 +518,6 @@ impl FileType {
     }
 }
 
-ext4_struct! { Ext4InodeRest {
-    padding: StaticLenString<96>,
-}}
-
 ext4_struct! { LegacyBlockDescriptor {
     direct: [u32; 12],
     indirect: u32,
@@ -543,57 +539,150 @@ impl LegacyBlockDescriptor {
     }
 }
 
-ext4_struct! { Ext4SingleExtent {
-    // 60 bytes
-    header: Ext4ExtentHeader = Ext4ExtentHeader::default(),     // 12 bytes
-    extent: Ext4Extent,           // 12 bytes
-    padding: StaticLenString<36>, // 36 bytes
+ext4_struct! { Ext4InlineExtents {
+    header: Ext4ExtentHeader,
+    extents: [Ext4ExtentLeafNode; 4],
 } }
-impl Ext4SingleExtent {
+impl Ext4InlineExtents {
+    pub const MAX_INLINE_BLOCKS: u64 = Ext4ExtentLeafNode::MAX_LEN as u64 * 4; // we can represent up to 4 extents, each with a maximum length of 65535 blocks
     pub fn new(allocation: Allocation) -> Self {
-        Ext4SingleExtent {
-            header: Ext4ExtentHeader::default(),
-            extent: Ext4Extent::new(allocation.start, (allocation.end - allocation.start) as u16),
-            padding: StaticLenString::default(),
+        let blocks = allocation.end - allocation.start;
+        assert!(blocks <= Self::MAX_INLINE_BLOCKS);
+        let extents_needed = blocks.div_ceil(Ext4ExtentLeafNode::MAX_LEN as u64);
+        let mut extents = [Ext4ExtentLeafNode::default(); 4];
+        for i in 0..extents_needed {
+            let len = if i == extents_needed - 1 {
+                u16::try_from(blocks - i * (Ext4ExtentLeafNode::MAX_LEN as u64)).unwrap()
+            } else {
+                Ext4ExtentLeafNode::MAX_LEN
+            };
+            let start = allocation.start + i * (Ext4ExtentLeafNode::MAX_LEN as u64);
+            extents[i as usize].set_start(start);
+            extents[i as usize].ee_len = len;
+            extents[i as usize].ee_block = (i * (Ext4ExtentLeafNode::MAX_LEN as u64)) as u32;
+        }
+
+        Ext4InlineExtents {
+            header: Ext4ExtentHeader {
+                eh_entries: extents_needed.try_into().unwrap(),
+                ..Default::default()
+            },
+            extents,
         }
     }
+
     #[cfg(test)]
     fn as_blocks_range(&self) -> std::ops::Range<u64> {
-        self.extent.start()..(self.extent.start() + self.extent.ee_len as u64)
+        assert_eq!(self.header.eh_entries, 1);
+        assert_eq!(self.header.eh_depth, 0);
+        self.extents[0].start()..(self.extents[0].start() + self.extents[0].ee_len as u64)
+    }
+}
+
+ext4_struct! { Ext4IndirectExtents {
+    header: Ext4ExtentHeader,
+    extents: [Ext4ExtentInternalNode; 4],
+} }
+impl Ext4IndirectExtents {
+    pub fn create_block(
+        allocation: Allocation,
+        inode_num: u32,
+        fs_uuid: &[u8; 16],
+    ) -> [u8; BLOCK_SIZE as usize] {
+        let blocks = allocation.end - allocation.start;
+        let extents_needed = blocks.div_ceil(Ext4ExtentLeafNode::MAX_LEN as u64);
+        assert!(
+            Ext4ExtentHeader::SIZE + extents_needed * Ext4ExtentLeafNode::SIZE + 4 /* checksum */
+                <= BLOCK_SIZE
+        );
+        let mut buf = [0u8; BLOCK_SIZE as usize];
+        let header = Ext4ExtentHeader {
+            eh_entries: extents_needed.try_into().unwrap(),
+            eh_max: ((BLOCK_SIZE - Ext4ExtentHeader::SIZE - 4) / Ext4ExtentLeafNode::SIZE) as u16,
+            eh_depth: 1,
+            ..Default::default()
+        };
+        header.write_buffer(&mut buf);
+        for i in 0..extents_needed {
+            dbg!(i);
+            let len = if i == extents_needed - 1 {
+                u16::try_from(blocks - i * (Ext4ExtentLeafNode::MAX_LEN as u64)).unwrap()
+            } else {
+                Ext4ExtentLeafNode::MAX_LEN
+            };
+            let start = allocation.start + i * (Ext4ExtentLeafNode::MAX_LEN as u64);
+            let mut extent = Ext4ExtentLeafNode::default();
+            extent.ee_block = (i * (Ext4ExtentLeafNode::MAX_LEN as u64)) as u32;
+            extent.ee_len = len;
+            extent.set_start(start);
+            let start_offset =
+                Ext4ExtentHeader::SIZE as usize + i as usize * Ext4ExtentLeafNode::SIZE as usize;
+            extent.write_buffer(&mut buf[start_offset..]);
+        }
+        let checksum_offset = BLOCK_SIZE as usize - 4;
+        let inode_generation: u32 = 0;
+        let checksum = calculate_checksum![
+            fs_uuid,
+            &inode_num.to_le_bytes(),
+            &inode_generation.to_le_bytes(),
+            &buf[0..checksum_offset]
+        ];
+        buf[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+        buf
+    }
+
+    pub fn new(block: u64) -> Self {
+        let mut extents = [Ext4ExtentInternalNode::default(); 4];
+        extents[0].set_leaf(block);
+        Ext4IndirectExtents {
+            header: Ext4ExtentHeader {
+                eh_entries: 1,
+                eh_depth: 1,
+                ..Default::default()
+            },
+            extents,
+        }
     }
 }
 
 ext4_struct! { Ext4ExtentHeader {
-    eh_magic: u16 = 0xF30A, /* probably will support different formats */
-    eh_entries: u16 = 1, /* number of valid entries */
-    eh_max: u16 = 4, /* capacity of store in entries */
-    eh_depth: u16 = 0, /* has tree real underlying blocks? */
+    eh_magic: u16 = 0xF30A,
+    eh_entries: u16,        /* number of valid entries */
+    eh_max: u16 = 4,        /* capacity of store in entries */
+    eh_depth: u16,          /* has tree real underlying blocks? */
     eh_generation: u32 = 0, /* generation of the tree */
 } }
 
-ext4_struct! { Ext4Extent {
+ext4_struct! { Ext4ExtentInternalNode {
+    ei_block: u32,      /* first logical block extent covers */
+    ei_leaf_lo: u32,    /* Lower 32-bits of the block number of the extent node that is the next level lower in the tree. */
+    ei_leaf_hi: u16,    /* high 16 bits of physical block */
+    ei_unused: u16 = 0, /* low 32 bits of physical block */
+} }
+impl Copy for Ext4ExtentInternalNode {}
+impl_buffer_for_array!(4, Ext4ExtentInternalNode, 12);
+impl Ext4ExtentInternalNode {
+    hi_lo_field_u48!(leaf, set_leaf, ei_leaf_hi, ei_leaf_lo);
+}
+
+ext4_struct! { Ext4ExtentLeafNode {
     ee_block: u32,    /* first logical block extent covers */
     ee_len: u16,      /* number of blocks covered by extent */
     ee_start_hi: u16, /* high 16 bits of physical block */
     ee_start_lo: u32, /* low 32 bits of physical block */
 } }
-impl Ext4Extent {
-    pub fn new(block: u64, len: u16) -> Self {
-        Ext4Extent {
-            ee_block: 0,
-            ee_len: len,
-            ee_start_lo: block as u32,
-            ee_start_hi: (block >> 32) as u16,
-        }
-    }
+impl Copy for Ext4ExtentLeafNode {}
+impl_buffer_for_array!(4, Ext4ExtentLeafNode, 12);
+impl Ext4ExtentLeafNode {
+    pub const MAX_LEN: u16 = 32768; // sizes bigger than this signify uninitialized extents
     hi_lo_field_u48!(start, set_start, ee_start_hi, ee_start_lo);
 }
 
 ext4_struct! { Ext4DirEntryMeta {
-    inode: u32,			           /* Inode number */
-    rec_len: u16,		           /* Directory entry length */
-    name_len: u8,		           /* Name length */
-    file_type: u8,		           /* See file type macros EXT4_FT_* below */
+    inode: u32,	   /* Inode number */
+    rec_len: u16,  /* Directory entry length */
+    name_len: u8,  /* Name length */
+    file_type: u8, /* See file type macros EXT4_FT_* below */
 } }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -606,8 +695,11 @@ impl Ext4DirEntry {
         Ext4DirEntry {
             meta: Ext4DirEntryMeta {
                 inode,
-                rec_len: (name.len() as u16 + 8).div_ceil(4) * 4, // align to 4 bytes
-                name_len: name.len() as u8,
+                rec_len: ((name.len() + 8).div_ceil(4) * 4).try_into().unwrap(), // align to 4 bytes
+                name_len: name
+                    .len()
+                    .try_into()
+                    .expect("directory entry names can at most be 255 bytes long"),
                 file_type: file_type.as_directory_entry_type(),
             },
             name: String::from(name),
@@ -640,10 +732,10 @@ impl Ext4DirEntry {
 
 ext4_struct! { Ext4DirEntryTail {
     det_reserved_zero: u32 = 0, /* Inode number, must be zero */
-    det_rec_len: u16 = 12,   /* Directory entry length */
+    det_rec_len: u16 = 12,      /* Directory entry length */
     det_reserved_zero2: u8 = 0, /* Name length, must be zero */
-    det_reserved_ft: u8 = 0xDE,      /* File type, must be 0xDE */
-    det_checksum: u32, /* Directory leaf block checksum. */
+    det_reserved_ft: u8 = 0xDE, /* File type, must be 0xDE */
+    det_checksum: u32,          /* Directory leaf block checksum. */
 } }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -694,7 +786,7 @@ impl Buffer<4096> for LinearDirectoryBlock {
         for (i, entry) in self.entries.iter().enumerate() {
             let mut entry = entry.clone();
             if i == self.entries.len() - 1 {
-                entry.meta.rec_len = (4096 - 12 - offset) as u16;
+                entry.meta.rec_len = (4096 - 12 - offset).try_into().unwrap();
             }
             let entry_bytes = entry.as_bytes();
             buf[offset..(offset + entry_bytes.len())].copy_from_slice(&entry_bytes);
@@ -711,8 +803,12 @@ impl Buffer<4096> for LinearDirectoryBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serialization::CheckMagic;
-    use std::fs;
+    use crate::{serialization::CheckMagic, util::buffer_from_hexdump};
+    use std::{
+        fs,
+        io::{Read, Seek},
+        ops::Range,
+    };
 
     #[test]
     fn test_static_len_str_str_len() {
@@ -746,7 +842,7 @@ mod tests {
         BitmapBlock::from_bytes(&[0u8; 4096], 128),
         4096
     );
-    test_size_of!(test_single_extent_size, Ext4SingleExtent::default(), 60);
+    test_size_of!(test_single_extent_size, Ext4InlineExtents::default(), 60);
     test_size_of!(test_inode_size, Ext4Inode::default(), 256);
     test_size_of!(
         test_legacy_block_descriptor_size,
@@ -756,50 +852,110 @@ mod tests {
     test_size_of!(test_dir_entry_tail_size, Ext4DirEntryTail::default(), 12);
 
     #[test]
+    fn test_indirect_extents() {
+        let buf = buffer_from_hexdump(
+            "
+            0000  0af3 0a00 5401 0000 0000 0000 0000 0000  ....T...........
+            0020  d95a 0000 2725 0000 d95a 0000 ff7f 0000  .Z..'%...Z......
+            0040  0185 0000 d8da 0000 007b 0000 0005 0100  .........{......
+            0060  d855 0100 ff7f 0000 0185 0100 d7d5 0100  .U..............
+            0100  0100 0000 0005 0200 d8d5 0100 fe7a 0000  .............z..
+            0120  0205 0200 d650 0200 ff7f 0000 0185 0200  .....P..........
+            0140  d5d0 0200 007b 0000 0005 0300 d54b 0300  .....{.......K..
+            0160  ff7f 0000 0185 0300 d4cb 0300 2c34 0000  ............,4..
+            0200  0005 0400 0000 0000 0000 0000 0000 0000  ................
+            0220  0000 0000 0000 0000 0000 0000 0000 0000  ................
+            *
+            7760  0000 0000 0000 0000 0000 0000 dbcc c82d  ...............-
+        ",
+        );
+        assert_eq!(buf.len(), BLOCK_SIZE as usize);
+        let header = Ext4ExtentHeader::read_buffer(&buf);
+        dbg!(&header);
+        for i in 0..header.eh_entries {
+            let start = Ext4ExtentHeader::SIZE as usize
+                + i as usize * Ext4ExtentInternalNode::SIZE as usize;
+            let extent = Ext4ExtentInternalNode::read_buffer(&buf[start..]);
+            dbg!(&extent);
+        }
+        let checksum = u32::from_le_bytes(buf[BLOCK_SIZE as usize - 4..].try_into().unwrap());
+        dbg!(checksum);
+        let fs_uuid: [u8; _] = [
+            220, 155, 229, 19, 223, 238, 78, 15, 153, 235, 134, 59, 35, 21, 141, 175,
+        ];
+        let inode_number = 12u32;
+        let inode_generation = 0u32;
+        let calculated_checksum = calculate_checksum![
+            &fs_uuid,
+            &inode_number.to_le_bytes(),
+            &inode_generation.to_le_bytes(),
+            &buf[0..BLOCK_SIZE as usize - 4]
+        ];
+        assert_eq!(checksum, calculated_checksum);
+    }
+
+    fn open_image() -> impl FnMut(Range<u64>) -> Vec<u8> {
+        let mut file = fs::File::open("test.img").unwrap();
+        move |range: Range<u64>| {
+            file.seek(std::io::SeekFrom::Start(range.start)).unwrap();
+            let mut buf = vec![0u8; (range.end - range.start) as usize];
+            file.read_exact(&mut buf).unwrap();
+            buf
+        }
+    }
+
+    #[test]
     fn test_read_superblock() {
-        let data = fs::read("test.img").unwrap();
-        let mut sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&data[1024..]);
+        let mut image = open_image();
+        let mut sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
+        dbg!(&sb);
         sb.update_checksum();
         sb.check_magic().unwrap();
     }
 
     #[test]
     fn test_read_block_group_table() {
-        let data = fs::read("test.img").unwrap();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&data[1024..]);
+        let mut image = open_image();
+        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
         let no_of_block_groups = sb.blocks_count().div_ceil(sb.s_blocks_per_group as u64);
         for i in 0..no_of_block_groups as usize {
-            let bgd: Ext4BlockGroupDescriptor =
-                Ext4BlockGroupDescriptor::read_buffer(&data[4096 + i * 256..]);
+            let bgd: Ext4BlockGroupDescriptor = Ext4BlockGroupDescriptor::read_buffer(&image(
+                (4096 + i * 256) as u64..(4096 + (i + 1) * 256) as u64,
+            ));
             println!("{:#?}", bgd);
         }
     }
 
     #[test]
     fn test_read_inode_bitmap() {
-        let data = fs::read("test.img").unwrap();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&data[1024..]);
+        let mut image = open_image();
+        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
-        let bgd: Ext4BlockGroupDescriptor = Ext4BlockGroupDescriptor::read_buffer(&data[4096..]);
+        let bgd: Ext4BlockGroupDescriptor =
+            Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
         let inode_bitmap_block = bgd.inode_bitmap();
-        let inode_bitmap =
-            BitmapBlock::read_buffer(&data[(inode_bitmap_block * BLOCK_SIZE) as usize..]);
+        let inode_bitmap = BitmapBlock::read_buffer(&image(
+            (inode_bitmap_block * BLOCK_SIZE) as u64
+                ..((inode_bitmap_block + 1) * BLOCK_SIZE) as u64,
+        ));
         println!("{inode_bitmap:#?}")
     }
 
     #[test]
     fn test_read_resize_inode() {
-        let data = fs::read("target/smoke.img").unwrap();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&data[1024..]);
+        let mut image = open_image();
+        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
-        let bgd: Ext4BlockGroupDescriptor = Ext4BlockGroupDescriptor::read_buffer(&data[4096..]);
+        let bgd: Ext4BlockGroupDescriptor =
+            Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
         let inode_table_block = bgd.inode_table();
         let resize_inode_num = 7;
         let inode_offset = (resize_inode_num - 1) * 256;
-        let mut inode: Ext4Inode = Ext4Inode::read_buffer(
-            &data[(inode_table_block * BLOCK_SIZE + inode_offset) as usize..],
-        );
+        let mut inode: Ext4Inode = Ext4Inode::read_buffer(&image(
+            (inode_table_block * BLOCK_SIZE + inode_offset) as u64
+                ..(inode_table_block * BLOCK_SIZE + inode_offset + Ext4Inode::SIZE) as u64,
+        ));
         let old_checksum = inode.checksum();
         inode.update_checksum(sb.uuid(), resize_inode_num as u32);
         assert_eq!(old_checksum, inode.checksum());
@@ -809,24 +965,27 @@ mod tests {
         let extent = LegacyBlockDescriptor::read_buffer(&inode.i_block);
         println!("{:#?}", extent);
         let block = extent.double_indirect;
-        let block_map = &data[((block as u64 + 0) * BLOCK_SIZE) as usize
-            ..((block as u64 + 2) * BLOCK_SIZE) as usize];
+        let block_map = &image(
+            ((block as u64 + 0) * BLOCK_SIZE) as u64..((block as u64 + 2) * BLOCK_SIZE) as u64,
+        );
         let block_map = <[u32; 1024]>::read_buffer(&block_map);
         println!("Indirect: {:?}", &block_map);
     }
 
     #[test]
     fn test_read_root_directory() {
-        let data = fs::read("test.img").unwrap();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&data[1024..]);
+        let mut image = open_image();
+        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
-        let bgd: Ext4BlockGroupDescriptor = Ext4BlockGroupDescriptor::read_buffer(&data[4096..]);
+        let bgd: Ext4BlockGroupDescriptor =
+            Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
         let inode_table_block = bgd.inode_table();
         let root_dir_inode_num = 2;
         let inode_offset = (root_dir_inode_num - 1) * 256;
-        let mut inode: Ext4Inode = Ext4Inode::read_buffer(
-            &data[(inode_table_block * BLOCK_SIZE + inode_offset) as usize..],
-        );
+        let mut inode: Ext4Inode = Ext4Inode::read_buffer(&image(
+            (inode_table_block * BLOCK_SIZE + inode_offset) as u64
+                ..(inode_table_block * BLOCK_SIZE + inode_offset + Ext4Inode::SIZE) as u64,
+        ));
         println!("{:#?}", inode);
 
         let old_checksum = inode.checksum();
@@ -834,17 +993,41 @@ mod tests {
         assert_eq!(old_checksum, inode.checksum());
 
         let block = &inode.block_mut();
-        let extent: Ext4SingleExtent = Ext4SingleExtent::read_buffer(block);
+        let extent: Ext4InlineExtents = Ext4InlineExtents::read_buffer(block);
         println!("{:#?}", extent);
 
         for block in extent.as_blocks_range() {
             dbg!(block);
-            let block_data =
-                &data[(block * BLOCK_SIZE) as usize..((block + 1) * BLOCK_SIZE) as usize];
+            let block_data = &image((block * BLOCK_SIZE) as u64..((block + 1) * BLOCK_SIZE) as u64);
             let mut dir_block = LinearDirectoryBlock::read_buffer(block_data);
             let old_checksum = dir_block.checksum;
             dir_block.update_checksum(sb.uuid(), root_dir_inode_num as u32, inode.i_generation);
             assert_eq!(old_checksum, dir_block.checksum);
         }
+    }
+
+    #[test]
+    fn test_read_file() {
+        let mut image = open_image();
+        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
+        sb.check_magic().unwrap();
+        let bgd: Ext4BlockGroupDescriptor =
+            Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
+        let inode_table_block = bgd.inode_table();
+        let file_inode_num = 12;
+        let inode_offset = (file_inode_num - 1) * 256;
+        let mut inode: Ext4Inode = Ext4Inode::read_buffer(&image(
+            (inode_table_block * BLOCK_SIZE + inode_offset)
+                ..(inode_table_block * BLOCK_SIZE + inode_offset + Ext4Inode::SIZE),
+        ));
+        println!("{:#?}", inode);
+
+        let old_checksum = inode.checksum();
+        inode.update_checksum(sb.uuid(), file_inode_num as u32);
+        assert_eq!(old_checksum, inode.checksum());
+
+        let block = &inode.block_mut();
+        let extent = Ext4IndirectExtents::read_buffer(block);
+        println!("{:#?}", extent);
     }
 }
