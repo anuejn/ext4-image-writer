@@ -895,7 +895,21 @@ mod tests {
     }
 
     fn open_image() -> impl FnMut(Range<u64>) -> Vec<u8> {
-        let mut file = fs::File::open("test.img").unwrap();
+        let image_path = "target/example.img";
+        let stamp_path = "target/example.img.stamp";
+        if !fs::exists(&image_path).unwrap() {
+            std::process::Command::new("mkfs.ext4")
+                .args(&["-d", "src/", image_path, "1000"])
+                .output()
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            fs::write(stamp_path, []).unwrap()
+        }
+        while !fs::exists(stamp_path).unwrap() {
+            // wait for the file to be fully written
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let mut file = fs::File::open(image_path).unwrap();
         move |range: Range<u64>| {
             file.seek(std::io::SeekFrom::Start(range.start)).unwrap();
             let mut buf = vec![0u8; (range.end - range.start) as usize];
