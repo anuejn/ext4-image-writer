@@ -1062,7 +1062,7 @@ mod tests {
     #[test]
     fn test_read_superblock() {
         let mut image = open_image();
-        let mut sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
+        let mut sb = Ext4SuperBlock::read_buffer(&image(1024..4096));
         dbg!(&sb);
         sb.update_checksum();
         sb.check_magic().unwrap();
@@ -1071,11 +1071,11 @@ mod tests {
     #[test]
     fn test_read_block_group_table() {
         let mut image = open_image();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
+        let sb = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
         let no_of_block_groups = sb.blocks_count().div_ceil(sb.s_blocks_per_group as u64);
         for i in 0..no_of_block_groups as usize {
-            let bgd: Ext4BlockGroupDescriptor = Ext4BlockGroupDescriptor::read_buffer(&image(
+            let bgd = Ext4BlockGroupDescriptor::read_buffer(&image(
                 (4096 + i * 256) as u64..(4096 + (i + 1) * 256) as u64,
             ));
             println!("{:#?}", bgd);
@@ -1085,10 +1085,9 @@ mod tests {
     #[test]
     fn test_read_inode_bitmap() {
         let mut image = open_image();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
+        let sb = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
-        let bgd: Ext4BlockGroupDescriptor =
-            Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
+        let bgd = Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
         let inode_bitmap_block = bgd.inode_bitmap();
         let inode_bitmap = BitmapBlock::read_buffer(&image(
             (inode_bitmap_block * BLOCK_SIZE) as u64
@@ -1100,14 +1099,13 @@ mod tests {
     #[test]
     fn test_read_resize_inode() {
         let mut image = open_image();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
+        let sb = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
-        let bgd: Ext4BlockGroupDescriptor =
-            Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
+        let bgd = Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
         let inode_table_block = bgd.inode_table();
         let resize_inode_num = 7;
         let inode_offset = (resize_inode_num - 1) * 256;
-        let mut inode: Ext4Inode = Ext4Inode::read_buffer(&image(
+        let mut inode = Ext4Inode::read_buffer(&image(
             (inode_table_block * BLOCK_SIZE + inode_offset) as u64
                 ..(inode_table_block * BLOCK_SIZE + inode_offset + Ext4Inode::SIZE) as u64,
         ));
@@ -1130,14 +1128,13 @@ mod tests {
     #[test]
     fn test_read_root_directory() {
         let mut image = open_image();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
+        let sb = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
-        let bgd: Ext4BlockGroupDescriptor =
-            Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
+        let bgd = Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
         let inode_table_block = bgd.inode_table();
         let root_dir_inode_num = 2;
         let inode_offset = (root_dir_inode_num - 1) * 256;
-        let mut inode: Ext4Inode = Ext4Inode::read_buffer(&image(
+        let mut inode = Ext4Inode::read_buffer(&image(
             (inode_table_block * BLOCK_SIZE + inode_offset) as u64
                 ..(inode_table_block * BLOCK_SIZE + inode_offset + Ext4Inode::SIZE) as u64,
         ));
@@ -1150,7 +1147,7 @@ mod tests {
         assert_eq!(old_checksum, inode.checksum());
 
         let block = &inode.block_mut();
-        let extent: Ext4InlineExtents = Ext4InlineExtents::read_buffer(block);
+        let extent = Ext4InlineExtents::read_buffer(block);
         extent.check_magic().unwrap();
         println!("{:#?}", extent);
 
@@ -1167,14 +1164,13 @@ mod tests {
     #[test]
     fn test_read_file() {
         let mut image = open_image();
-        let sb: Ext4SuperBlock = Ext4SuperBlock::read_buffer(&image(1024..4096));
+        let sb = Ext4SuperBlock::read_buffer(&image(1024..4096));
         sb.check_magic().unwrap();
-        let bgd: Ext4BlockGroupDescriptor =
-            Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
+        let bgd = Ext4BlockGroupDescriptor::read_buffer(&image(4096..8192));
         let inode_table_block = bgd.inode_table();
         let file_inode_num = 12;
         let inode_offset = (file_inode_num - 1) * 256;
-        let mut inode: Ext4Inode = Ext4Inode::read_buffer(&image(
+        let mut inode = Ext4Inode::read_buffer(&image(
             (inode_table_block * BLOCK_SIZE + inode_offset)
                 ..(inode_table_block * BLOCK_SIZE + inode_offset + Ext4Inode::SIZE),
         ));

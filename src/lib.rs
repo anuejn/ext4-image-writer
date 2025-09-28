@@ -77,7 +77,7 @@ pub struct Ext4ImageWriter<W: io::Write + io::Seek> {
     used_inodes: UsageBitmap,
 }
 impl<W: io::Write + io::Seek> Ext4ImageWriter<W> {
-    /// Create a new `Ext4ImageWriter` that writes to the given block device.
+    /// Create a new `Ext4ImageWriter` that writes to the given writer (i.e. a file or an in-memory buffer).
     /// The `max_size` parameter specifies the maximum size of the image in bytes (potentially after resizing).
     /// This is used to determine the space reserved for block group descriptors.
     pub fn new(writer: W, max_size: u64) -> Self {
