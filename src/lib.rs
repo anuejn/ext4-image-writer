@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use crate::{ext4_h::*, file_tree::Directory, serialization::Buffer};
 use std::io::{self, Cursor, Write};
 
