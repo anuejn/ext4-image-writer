@@ -133,7 +133,7 @@ ext4_struct! { Ext4SuperBlock {
     s_encrypt_pw_salt: [u8; 16], /* Salt used for string2key algorithm */
     s_lpf_ino: u32,              /* Location of the lost+found inode */
     s_prj_quota_inum: u32,       /* inode for tracking project quota */
-    s_checksum_seed: u32 = 0,        /* crc32c(uuid) if csum_seed set */
+    s_checksum_seed: u32,        /* crc32c(uuid) if csum_seed set */
     s_wtime_hi: u8,
     s_mtime_hi: u8,
     s_mkfs_time_hi: u8,
@@ -1031,7 +1031,16 @@ mod tests {
         let stamp_path = "target/example.img.stamp";
         if !fs::exists(&image_path).unwrap() {
             std::process::Command::new("mkfs.ext4")
-                .args(&["-d", "src/", "-O", "inline_data", image_path, "1000"])
+                .args(&[
+                    "-d",
+                    "src/",
+                    "-O",
+                    "inline_data",
+                    "-b",
+                    "4096",
+                    image_path,
+                    "1000",
+                ])
                 .output()
                 .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(100));
