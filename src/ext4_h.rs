@@ -170,8 +170,8 @@ impl Ext4SuperBlock {
             s_first_ino: 11,
             s_inode_size: 256,
             s_block_group_nr: 0,
-            s_feature_compat: 0x0038 | 0x0200, /* sparse_super2 */
-            s_feature_incompat: 0x02c2,
+            s_feature_compat: 0x0038 | 0x0200,   /* sparse_super2 */
+            s_feature_incompat: 0x02c2 | 0x8000, /* inline_data */
             s_feature_ro_compat: 0x046a,
             s_uuid: uuid,
             s_hash_seed: [940062939, 3880703204, 772543626, 1391354066],
@@ -419,7 +419,7 @@ ext4_struct! { Ext4Inode {
     i_gid_high: u16,    /* were reserved2[0] */
     i_checksum_lo: u16, /* crc32c(uuid+inum+inode) LE */
     l_i_reserved: u16,
-    i_extra_isize: u16,
+    i_extra_isize: u16 = 32,
     i_checksum_hi: u16,  /* crc32c(uuid+inum+inode) BE */
     i_ctime_extra: u32,  /* extra Change time      (nsec << 2 | epoch) */
     i_mtime_extra: u32,  /* extra Modification time(nsec << 2 | epoch) */
@@ -443,6 +443,39 @@ impl Ext4Inode {
     hi_lo_field_u64!(size, set_size, i_size_high, i_size_lo);
     hi_lo_field_u48!(blocks, set_blocks, i_blocks_high, i_blocks_lo);
     hi_lo_field_u32!(checksum, set_checksum, i_checksum_hi, i_checksum_lo);
+
+    pub const MAX_INLINE_SIZE_BLOCK: usize = 60; // 60 bytes in i_block
+    pub const MAX_INLINE_SIZE_XATTR: usize = 96 - Ext4ExtAttrEntryData::SIZE as usize - 4 - 4; // rest - xattr header
+    pub const MAX_INLINE_SIZE: usize = Self::MAX_INLINE_SIZE_BLOCK + Self::MAX_INLINE_SIZE_XATTR;
+    pub fn with_inline_data(block_data: &[u8], xattr_data: &[u8], ty: FileType) -> Self {
+        let mut inode = Ext4Inode::default();
+
+        inode.set_file_type(ty);
+        inode.i_links_count = 1;
+        inode.set_size((block_data.len() + xattr_data.len()) as u64);
+
+        assert!(block_data.len() <= Self::MAX_INLINE_SIZE_BLOCK);
+        assert!(xattr_data.len() <= Self::MAX_INLINE_SIZE_XATTR);
+        if block_data.len() < inode.i_block.len() {
+            assert!(xattr_data.is_empty());
+        }
+
+        inode.i_flags |= 0x10000000; // EXT4_INLINE_DATA_FL
+        inode.i_block[..block_data.len()].copy_from_slice(block_data);
+
+        let xattr_magic: u32 = 0xEA020000;
+        inode.rest[0..4].copy_from_slice(&xattr_magic.to_le_bytes());
+        let xattr = Ext4ExtAttrEntryData {
+            e_value_offs: (Ext4ExtAttrEntryData::SIZE + 4).try_into().unwrap(),
+            e_value_size: xattr_data.len().try_into().unwrap(),
+            ..Default::default()
+        };
+        xattr.write_buffer(&mut inode.rest[4..]);
+        let offset = 4 + 4 + Ext4ExtAttrEntryData::SIZE as usize;
+        inode.rest[offset..(offset + xattr_data.len())].copy_from_slice(xattr_data);
+
+        inode
+    }
 
     pub fn update_size(&mut self, size: u64) {
         self.set_size(size);
@@ -485,6 +518,7 @@ impl Ext4Inode {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
+    Null,
     Fifo,
     CharacterDevice,
     Directory,
@@ -496,6 +530,7 @@ pub enum FileType {
 impl FileType {
     pub fn as_mode(&self) -> u16 {
         match self {
+            FileType::Null => 0,
             FileType::Fifo => 0x1000,            // S_IFifo
             FileType::CharacterDevice => 0x2000, // S_IFCHR
             FileType::Directory => 0x4000,       // S_IFDIR
@@ -507,6 +542,7 @@ impl FileType {
     }
     pub fn as_directory_entry_type(&self) -> u8 {
         match self {
+            FileType::Null => 0,
             FileType::RegularFile => 1,
             FileType::Directory => 2,
             FileType::CharacterDevice => 3,
@@ -517,6 +553,16 @@ impl FileType {
         }
     }
 }
+
+ext4_struct! { Ext4ExtAttrEntryData {
+    e_name_len: u8 = 4,	    /* length of name */
+    e_name_index: u8 = 7,	/* attribute name index */
+    e_value_offs: u16 = 20,	/* offset of the value relative to the first entry */
+    e_value_inum: u32 = 0,	/* inode in which the value is stored */
+    e_value_size: u32,	    /* size of attribute value */
+    e_hash: u32 = 0,		/* hash value of name and value */
+    e_name: [u8; 4] = [0x64, 0x61, 0x74, 0x61],	/* attribute name = "data" */
+} }
 
 ext4_struct! { LegacyBlockDescriptor {
     direct: [u32; 12],
@@ -604,7 +650,6 @@ impl Ext4IndirectExtents {
         };
         header.write_buffer(&mut buf);
         for i in 0..extents_needed {
-            dbg!(i);
             let len = if i == extents_needed - 1 {
                 u16::try_from(blocks - i * (Ext4ExtentLeafNode::MAX_LEN as u64)).unwrap()
             } else {
@@ -716,6 +761,12 @@ impl Ext4DirEntry {
     pub fn is_directory(&self) -> bool {
         self.meta.file_type == FileType::Directory.as_directory_entry_type()
     }
+    pub fn inode(&self) -> u32 {
+        self.meta.inode
+    }
+    pub fn set_record_length(&mut self, rec_len: u16) {
+        self.meta.rec_len = rec_len;
+    }
 
     #[allow(dead_code)]
     pub fn read_buffer(buf: &[u8]) -> Self {
@@ -755,7 +806,7 @@ impl LinearDirectoryBlock {
     pub fn fits(&self, entry: &Ext4DirEntry) -> bool {
         self.entries
             .iter()
-            .map(|e| e.meta.rec_len as usize)
+            .map(|e: &Ext4DirEntry| e.meta.rec_len as usize)
             .sum::<usize>()
             + (entry.meta.rec_len as usize + Ext4DirEntryMeta::SIZE as usize)
             + Ext4DirEntryTail::SIZE as usize
@@ -800,10 +851,62 @@ impl Buffer<4096> for LinearDirectoryBlock {
     }
 }
 
+#[derive(Debug)]
+pub struct InlineLinearDirectoryBlock {
+    entries: Vec<Ext4DirEntry>,
+    size: usize,
+}
+impl InlineLinearDirectoryBlock {
+    pub fn new(size: usize) -> Self {
+        InlineLinearDirectoryBlock {
+            entries: Vec::new(),
+            size,
+        }
+    }
+
+    pub fn fits(&self, entry: &Ext4DirEntry) -> bool {
+        self.entries
+            .iter()
+            .map(|e: &Ext4DirEntry| e.meta.rec_len as usize)
+            .sum::<usize>()
+            + (entry.meta.rec_len as usize + Ext4DirEntryMeta::SIZE as usize)
+            <= self.size
+    }
+    pub fn add_entry(&mut self, entry: Ext4DirEntry) {
+        assert!(self.fits(&entry));
+        self.entries.push(entry);
+    }
+
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; self.size];
+        if self.entries.is_empty() {
+            let mut entry = Ext4DirEntry::new(0, FileType::Null, "");
+            entry.set_record_length(self.size.try_into().unwrap());
+            let entry_bytes = entry.as_bytes();
+            buf[..entry_bytes.len()].copy_from_slice(&entry_bytes);
+            return buf;
+        }
+        let mut offset = 0;
+        for (i, entry) in self.entries.iter().enumerate() {
+            let mut entry = entry.clone();
+            if i == self.entries.len() - 1 {
+                entry.meta.rec_len = (self.size - offset).try_into().unwrap();
+            }
+            let entry_bytes = entry.as_bytes();
+            buf[offset..(offset + entry_bytes.len())].copy_from_slice(&entry_bytes);
+            offset += entry_bytes.len();
+        }
+        buf
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{serialization::CheckMagic, util::buffer_from_hexdump};
+    use crate::{
+        serialization::CheckMagic,
+        util::{buffer_from_hexdump, hexdump},
+    };
     use std::{
         fs,
         io::{Read, Seek},
@@ -850,6 +953,35 @@ mod tests {
         60
     );
     test_size_of!(test_dir_entry_tail_size, Ext4DirEntryTail::default(), 12);
+
+    #[test]
+    fn test_read_inline_dir_inode() {
+        let buf = buffer_from_hexdump(
+            "
+            0000  fd41 e803 3c00 0000 ee72 d868 8b1f d768  .A..<....r.h...h
+            0020  8b1f d768 0000 0000 e803 0400 0000 0000  ...h............
+            0040  0000 0010 0000 0000 0200 0000 0d00 0000  ................
+            0060  1400 0c02 6c6f 6e67 6572 5f65 6e74 7279  ....longer_entry
+            0100  0e00 0000 2400 0b02 7368 6f72 745f 656e  ....$...short_en
+            0120  7472 7900 0000 0000 0000 0000 0000 0000  try.............
+            0140  0000 0000 0000 0000 0000 0000 0000 0000  ................
+            0160  0000 0000 0000 0000 0000 0000 bade 0000  ................
+            0200  2000 75b0 0000 0000 0000 0000 0000 0000   .u.............
+            0220  b77a d868 0000 0000 0000 0000 0000 0000  .z.h............
+            0240  0000 02ea 0407 5c00 0000 0000 0000 0000  ......\\.........
+            0260  0000 0000 6461 7461 0000 0000 0000 0000  ....data........
+            0300  0000 0000 0000 0000 0000 0000 0000 0000  ................
+            *
+            0360  0000 0000 0000 0000 0000 0000 0000 0000  ................
+
+        ",
+        );
+        let inode = Ext4Inode::read_buffer(&buf);
+        dbg!(&inode);
+
+        println!("{}", hexdump(&inode.i_block));
+        println!("{}", hexdump(&inode.rest));
+    }
 
     #[test]
     fn test_indirect_extents() {
@@ -899,7 +1031,7 @@ mod tests {
         let stamp_path = "target/example.img.stamp";
         if !fs::exists(&image_path).unwrap() {
             std::process::Command::new("mkfs.ext4")
-                .args(&["-d", "src/", image_path, "1000"])
+                .args(&["-d", "src/", "-O", "inline_data", image_path, "1000"])
                 .output()
                 .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1001,6 +1133,8 @@ mod tests {
                 ..(inode_table_block * BLOCK_SIZE + inode_offset + Ext4Inode::SIZE) as u64,
         ));
         println!("{:#?}", inode);
+        println!("{}", hexdump(&inode.block_mut()));
+        println!("{}", hexdump(&inode.rest));
 
         let old_checksum = inode.checksum();
         inode.update_checksum(sb.uuid(), root_dir_inode_num as u32);
@@ -1008,6 +1142,7 @@ mod tests {
 
         let block = &inode.block_mut();
         let extent: Ext4InlineExtents = Ext4InlineExtents::read_buffer(block);
+        extent.check_magic().unwrap();
         println!("{:#?}", extent);
 
         for block in extent.as_blocks_range() {

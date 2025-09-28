@@ -1,4 +1,4 @@
-use crate::{ext4_h::*, file_tree::Directory, serialization::Buffer};
+use crate::{ext4_h::*, file_tree::Directory, serialization::Buffer, util::hexdump};
 use std::io::{self, Cursor, Write};
 
 mod ext4_h;
@@ -324,11 +324,65 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
                 })
             }))
             .collect::<io::Result<Vec<_>>>()?;
-        self.inodes[inode_num as usize - 1] = self.create_directory_inode(inode_num, &entries)?;
+
+        self.inodes[inode_num as usize - 1] = self.create_directory_inode(
+            inode_num,
+            &entries,
+            inode_num != 11, /* lost+found cant be inline */
+        )?;
         Ok(())
     }
 
     fn create_directory_inode(
+        &mut self,
+        inode_num: u64,
+        entries: &[Ext4DirEntry],
+        allow_inline: bool,
+    ) -> io::Result<Ext4Inode> {
+        let mut inode = if let Some(inode) = self.create_directory_inode_inline(inode_num, entries)
+            && allow_inline
+        {
+            inode
+        } else {
+            self.create_directory_inode_with_blocks(inode_num, entries)?
+        };
+        let subdirectories = entries.iter().filter(|e| e.is_directory()).count();
+        inode.set_links_count(2 + (<u16>::try_from(subdirectories).unwrap() - 2)); // 1 for the parent, one for '.' and 1 for each subdirectory
+        inode.set_mode(0o755);
+        Ok(inode)
+    }
+
+    fn create_directory_inode_inline(
+        &mut self,
+        inode_num: u64,
+        entries: &[Ext4DirEntry],
+    ) -> Option<Ext4Inode> {
+        let mut block_entries =
+            InlineLinearDirectoryBlock::new(Ext4Inode::MAX_INLINE_SIZE_BLOCK - 4);
+        let mut xattr_entries = InlineLinearDirectoryBlock::new(Ext4Inode::MAX_INLINE_SIZE_XATTR);
+        for entry in entries[2..].iter() {
+            if block_entries.fits(entry) {
+                block_entries.add_entry(entry.clone());
+            } else if xattr_entries.fits(entry) {
+                xattr_entries.add_entry(entry.clone());
+            } else {
+                return None; // cant fit entries inline
+            }
+        }
+
+        let parent_inode = entries[1].inode();
+        let mut block_data = [0u8; Ext4Inode::MAX_INLINE_SIZE_BLOCK];
+        block_data[0..4].copy_from_slice(&parent_inode.to_le_bytes());
+        block_data[4..].copy_from_slice(&block_entries.as_bytes());
+
+        Some(Ext4Inode::with_inline_data(
+            &block_data,
+            &xattr_entries.as_bytes(),
+            FileType::Directory,
+        ))
+    }
+
+    fn create_directory_inode_with_blocks(
         &mut self,
         inode_num: u64,
         entries: &[Ext4DirEntry],
@@ -348,13 +402,7 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
                 &mut dir_buffer[i * BLOCK_SIZE as usize..(i + 1) * BLOCK_SIZE as usize],
             );
         }
-        let mut inode =
-            self.create_inode_with_contents(inode_num as u32, &dir_buffer, FileType::Directory)?;
-        let subdirectories = entries.iter().filter(|e| e.is_directory()).count();
-        inode.set_links_count(2 + (<u16>::try_from(subdirectories).unwrap() - 2)); // 1 for the parent, one for '.' and 1 for each subdirectory
-        inode.set_mode(0o755);
-        inode.update_size((dir_buffer.len() as u64).div_ceil(BLOCK_SIZE) * BLOCK_SIZE);
-        Ok(inode)
+        self.create_inode_with_contents(inode_num as u32, &dir_buffer, FileType::Directory)
     }
 
     fn create_inode_with_contents(
@@ -363,10 +411,20 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         contents: &[u8],
         ty: FileType,
     ) -> io::Result<Ext4Inode> {
-        let allocation = self.write_blocks_alloc(contents)?;
-        let inode =
-            self.create_inode_with_extents(inode_num, contents.len() as u64, allocation, ty)?;
-        Ok(inode)
+        if contents.len() <= Ext4Inode::MAX_INLINE_SIZE {
+            let block_data = &contents[..Ext4Inode::MAX_INLINE_SIZE_BLOCK.min(contents.len())];
+            let xattr_data = if contents.len() > Ext4Inode::MAX_INLINE_SIZE_BLOCK {
+                &contents[Ext4Inode::MAX_INLINE_SIZE_BLOCK..]
+            } else {
+                &[]
+            };
+            Ok(Ext4Inode::with_inline_data(block_data, xattr_data, ty))
+        } else {
+            let allocation = self.write_blocks_alloc(contents)?;
+            let inode =
+                self.create_inode_with_extents(inode_num, contents.len() as u64, allocation, ty)?;
+            Ok(inode)
+        }
     }
 
     fn create_inode_with_extents(
@@ -496,6 +554,25 @@ mod tests {
             .arg("-f")
             .arg("-n")
             .arg("target/big_file.img")
+            .output()
+            .unwrap();
+        assert!(process.status.success());
+    }
+
+    #[test]
+    fn test_ext4_image_writer_inline_dirs() {
+        let _ = std::fs::remove_file("target/inline_dirs.img");
+        let file = std::fs::File::create("target/inline_dirs.img").unwrap();
+        let mut writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
+        writer.mkdir("dir").unwrap();
+        writer.write_file(&[], "dir/longer_entry", 0o755).unwrap();
+        writer.write_file(&[], "dir/short_entry", 0o755).unwrap();
+        writer.write_file(&[], "dir/over_the_edge", 0o755).unwrap();
+        writer.finalize().unwrap();
+        let process = std::process::Command::new("e2fsck")
+            .arg("-f")
+            .arg("-n")
+            .arg("target/inline_dirs.img")
             .output()
             .unwrap();
         assert!(process.status.success());
