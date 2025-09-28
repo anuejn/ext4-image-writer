@@ -11,19 +11,6 @@ mod util;
 
 const BLOCK_SIZE: u64 = 4096;
 
-pub trait BlockWriteDeviece {
-    fn write_block(&mut self, block_num: u64, buf: &[u8]) -> io::Result<()>;
-}
-
-impl<W: io::Write + io::Seek> BlockWriteDeviece for W {
-    fn write_block(&mut self, block_num: u64, buf: &[u8]) -> io::Result<()> {
-        assert!(buf.len() <= BLOCK_SIZE as usize);
-        self.seek(io::SeekFrom::Start(block_num * BLOCK_SIZE))?;
-        self.write_all(buf)?;
-        Ok(())
-    }
-}
-
 #[derive(Default)]
 struct UsageBitmap {
     data: Vec<u8>,
@@ -75,9 +62,12 @@ impl Allocation {
         assert!(self.end == self.start + 1);
         self.start
     }
+    pub fn len(self) -> u64 {
+        self.end - self.start
+    }
 }
 
-pub struct Ext4ImageWriter<W: BlockWriteDeviece> {
+pub struct Ext4ImageWriter<W: io::Write + io::Seek> {
     writer: W,
     uuid: [u8; 16],
     max_size: u64,
@@ -87,7 +77,7 @@ pub struct Ext4ImageWriter<W: BlockWriteDeviece> {
     used_blocks: UsageBitmap,
     used_inodes: UsageBitmap,
 }
-impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
+impl<W: io::Write + io::Seek> Ext4ImageWriter<W> {
     /// Create a new `Ext4ImageWriter` that writes to the given block device.
     /// The `max_size` parameter specifies the maximum size of the image in bytes (potentially after resizing).
     /// This is used to determine the space reserved for block group descriptors.
@@ -151,8 +141,8 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         Ok(())
     }
 
-    /// Write all metadata to the underlying block device and finish writhing the filesystem
-    pub fn finalize(mut self) -> io::Result<()> {
+    /// Write all metadata to the underlying block device and finish writing the filesystem
+    pub fn finish(mut self) -> io::Result<W> {
         let directories = std::mem::take(&mut self.directories);
         self.write_hierarchy_to_inodes(&directories, 2, 2)?;
 
@@ -255,9 +245,8 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         superblock.update_checksum();
         let mut first_block = [0u8; BLOCK_SIZE as usize];
         first_block[1024..1024 + 1024].copy_from_slice(&superblock.as_bytes());
-        self.writer.write_block(0, &first_block)?;
-
-        Ok(())
+        self.write_blocks(Allocation::from_start_len(0, 1), &first_block)?;
+        Ok(self.writer)
     }
 
     fn create_resize_inode(&mut self, block_groups: u64) -> io::Result<Ext4Inode> {
@@ -456,18 +445,10 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
     }
 
     fn write_blocks(&mut self, allocation: Allocation, data: &[u8]) -> io::Result<()> {
-        let mut offset = 0;
-        let mut block_num = allocation.start;
-        while offset < data.len() {
-            let end = (offset + BLOCK_SIZE as usize).min(data.len());
-            let mut block = [0u8; BLOCK_SIZE as usize];
-            block[..end - offset].copy_from_slice(&data[offset..end]);
-            self.writer.write_block(block_num, &block)?;
-            offset += BLOCK_SIZE as usize;
-            block_num += 1;
-        }
-        assert!(allocation.end >= block_num);
-        Ok(())
+        assert!(allocation.len() * BLOCK_SIZE >= data.len() as u64);
+        self.writer
+            .seek(io::SeekFrom::Start(allocation.start * BLOCK_SIZE))?;
+        self.writer.write_all(data)
     }
 
     fn write_blocks_alloc(&mut self, data: &[u8]) -> io::Result<Allocation> {
@@ -487,7 +468,7 @@ mod tests {
         let _ = std::fs::remove_file("target/minimal.img");
         let file = std::fs::File::create("target/minimal.img").unwrap();
         let writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024);
-        writer.finalize().unwrap();
+        writer.finish().unwrap();
         let process = std::process::Command::new("e2fsck")
             .arg("-f")
             .arg("-n")
@@ -511,7 +492,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        writer.finalize().unwrap();
+        writer.finish().unwrap();
         let process = std::process::Command::new("e2fsck")
             .arg("-f")
             .arg("-n")
@@ -530,7 +511,7 @@ mod tests {
         writer
             .write_file(&zero_size_file, "zero_size_file.bin", 0o644)
             .unwrap();
-        writer.finalize().unwrap();
+        writer.finish().unwrap();
         let process = std::process::Command::new("e2fsck")
             .arg("-f")
             .arg("-n")
@@ -547,7 +528,7 @@ mod tests {
         let mut writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
         let big_file = vec![0xABu8; 1024 * 1024 * 1024];
         writer.write_file(&big_file, "big-file.bin", 0o644).unwrap();
-        writer.finalize().unwrap();
+        writer.finish().unwrap();
         let process = std::process::Command::new("e2fsck")
             .arg("-f")
             .arg("-n")
@@ -566,7 +547,7 @@ mod tests {
         writer.write_file(&[], "dir/longer_entry", 0o755).unwrap();
         writer.write_file(&[], "dir/short_entry", 0o755).unwrap();
         writer.write_file(&[], "dir/over_the_edge", 0o755).unwrap();
-        writer.finalize().unwrap();
+        writer.finish().unwrap();
         let process = std::process::Command::new("e2fsck")
             .arg("-f")
             .arg("-n")
