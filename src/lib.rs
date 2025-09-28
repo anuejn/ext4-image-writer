@@ -1,4 +1,4 @@
-use crate::{ext4_h::*, file_tree::Directory, serialization::Buffer, util::hexdump};
+use crate::{ext4_h::*, file_tree::Directory, serialization::Buffer};
 use std::io::{self, Cursor, Write};
 
 mod ext4_h;

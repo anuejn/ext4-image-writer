@@ -1,5 +1,5 @@
 [package]
-name = "ext4-writer"
+name = "ext4-image-writer"
 description = "A simple ext4 image writing library"
 version = "0.1.0"
 edition = "2024"

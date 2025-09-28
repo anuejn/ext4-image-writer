@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ext4-writer"
+name = "ext4-image-writer"
 version = "0.1.0"
 dependencies = [
  "crc32c",
