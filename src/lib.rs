@@ -341,7 +341,7 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         entries: &[Ext4DirEntry],
         allow_inline: bool,
     ) -> io::Result<Ext4Inode> {
-        let mut inode = if let Some(inode) = self.create_directory_inode_inline(inode_num, entries)
+        let mut inode = if let Some(inode) = self.create_directory_inode_inline(entries)
             && allow_inline
         {
             inode
@@ -354,11 +354,7 @@ impl<W: BlockWriteDeviece> Ext4ImageWriter<W> {
         Ok(inode)
     }
 
-    fn create_directory_inode_inline(
-        &mut self,
-        inode_num: u64,
-        entries: &[Ext4DirEntry],
-    ) -> Option<Ext4Inode> {
+    fn create_directory_inode_inline(&mut self, entries: &[Ext4DirEntry]) -> Option<Ext4Inode> {
         let mut block_entries =
             InlineLinearDirectoryBlock::new(Ext4Inode::MAX_INLINE_SIZE_BLOCK - 4);
         let mut xattr_entries = InlineLinearDirectoryBlock::new(Ext4Inode::MAX_INLINE_SIZE_XATTR);
