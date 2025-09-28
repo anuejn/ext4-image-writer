@@ -1,5 +1,5 @@
 use crate::serialization::{
-    Buffer, StaticLenString, ext4_struct, hi_lo_field_u32, hi_lo_field_u48, hi_lo_field_u64,
+    Buffer, StaticLenString, buffer_struct, hi_lo_field_u32, hi_lo_field_u48, hi_lo_field_u64,
     impl_buffer_for_array,
 };
 use crate::{Allocation, BLOCK_SIZE};
@@ -17,7 +17,7 @@ macro_rules! calculate_checksum {
     };
 }
 
-ext4_struct! { Ext4SuperBlock {
+buffer_struct! { Ext4SuperBlock {
     /*00*/ s_inodes_count: u32,         /* Inodes count */
     s_blocks_count_lo: u32,      /* Blocks count */
     s_r_blocks_count_lo: u32,    /* Reserved blocks count */
@@ -233,7 +233,7 @@ impl Ext4SuperBlock {
     }
 }
 
-ext4_struct! { Ext4BlockGroupDescriptor {
+buffer_struct! { Ext4BlockGroupDescriptor {
     bg_block_bitmap_lo: u32,      /* Blocks bitmap block */
     bg_inode_bitmap_lo: u32,      /* Inodes bitmap block */
     bg_inode_table_lo: u32,       /* Inodes table block */
@@ -395,7 +395,7 @@ impl Buffer<4096> for BitmapBlock {
     }
 }
 
-ext4_struct! { Ext4Inode {
+buffer_struct! { Ext4Inode {
     i_mode: u16,               /* File mode */
     i_uid: u16,                /* Low 16 bits of Owner Uid */
     i_size_lo: u32,            /* Size in bytes */
@@ -554,7 +554,7 @@ impl FileType {
     }
 }
 
-ext4_struct! { Ext4ExtAttrEntryData {
+buffer_struct! { Ext4ExtAttrEntryData {
     e_name_len: u8 = 4,	    /* length of name */
     e_name_index: u8 = 7,	/* attribute name index */
     e_value_offs: u16 = 20,	/* offset of the value relative to the first entry */
@@ -564,7 +564,7 @@ ext4_struct! { Ext4ExtAttrEntryData {
     e_name: [u8; 4] = [0x64, 0x61, 0x74, 0x61],	/* attribute name = "data" */
 } }
 
-ext4_struct! { LegacyBlockDescriptor {
+buffer_struct! { LegacyBlockDescriptor {
     direct: [u32; 12],
     indirect: u32,
     double_indirect: u32,
@@ -585,7 +585,7 @@ impl LegacyBlockDescriptor {
     }
 }
 
-ext4_struct! { Ext4InlineExtents {
+buffer_struct! { Ext4InlineExtents {
     header: Ext4ExtentHeader,
     extents: [Ext4ExtentLeafNode; 4],
 } }
@@ -625,7 +625,7 @@ impl Ext4InlineExtents {
     }
 }
 
-ext4_struct! { Ext4IndirectExtents {
+buffer_struct! { Ext4IndirectExtents {
     header: Ext4ExtentHeader,
     extents: [Ext4ExtentInternalNode; 4],
 } }
@@ -690,7 +690,7 @@ impl Ext4IndirectExtents {
     }
 }
 
-ext4_struct! { Ext4ExtentHeader {
+buffer_struct! { Ext4ExtentHeader {
     eh_magic: u16 = 0xF30A,
     eh_entries: u16,        /* number of valid entries */
     eh_max: u16 = 4,        /* capacity of store in entries */
@@ -698,7 +698,7 @@ ext4_struct! { Ext4ExtentHeader {
     eh_generation: u32 = 0, /* generation of the tree */
 } }
 
-ext4_struct! { Ext4ExtentInternalNode {
+buffer_struct! { Ext4ExtentInternalNode {
     ei_block: u32,      /* first logical block extent covers */
     ei_leaf_lo: u32,    /* Lower 32-bits of the block number of the extent node that is the next level lower in the tree. */
     ei_leaf_hi: u16,    /* high 16 bits of physical block */
@@ -710,7 +710,7 @@ impl Ext4ExtentInternalNode {
     hi_lo_field_u48!(leaf, set_leaf, ei_leaf_hi, ei_leaf_lo);
 }
 
-ext4_struct! { Ext4ExtentLeafNode {
+buffer_struct! { Ext4ExtentLeafNode {
     ee_block: u32,    /* first logical block extent covers */
     ee_len: u16,      /* number of blocks covered by extent */
     ee_start_hi: u16, /* high 16 bits of physical block */
@@ -723,7 +723,7 @@ impl Ext4ExtentLeafNode {
     hi_lo_field_u48!(start, set_start, ee_start_hi, ee_start_lo);
 }
 
-ext4_struct! { Ext4DirEntryMeta {
+buffer_struct! { Ext4DirEntryMeta {
     inode: u32,	   /* Inode number */
     rec_len: u16,  /* Directory entry length */
     name_len: u8,  /* Name length */
@@ -781,7 +781,7 @@ impl Ext4DirEntry {
     }
 }
 
-ext4_struct! { Ext4DirEntryTail {
+buffer_struct! { Ext4DirEntryTail {
     det_reserved_zero: u32 = 0, /* Inode number, must be zero */
     det_rec_len: u16 = 12,      /* Directory entry length */
     det_reserved_zero2: u8 = 0, /* Name length, must be zero */

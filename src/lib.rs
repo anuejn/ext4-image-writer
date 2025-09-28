@@ -5,7 +5,6 @@ use std::io::{self, Cursor, Write};
 
 mod ext4_h;
 mod file_tree;
-#[macro_use]
 mod serialization;
 mod util;
 

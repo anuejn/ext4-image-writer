@@ -140,7 +140,7 @@ pub const fn buffer_size<const N: usize, T: Buffer<N>>() -> usize {
     N
 }
 
-macro_rules! ext4_struct {
+macro_rules! buffer_struct {
     ($name:ident { $( $it:ident : $value:ty $(= $default:expr)?, )* }) => {
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub struct $name {
@@ -167,7 +167,7 @@ macro_rules! ext4_struct {
         impl Default for $name {
             fn default() -> Self {
                 Self {$(
-                    $it: ext4_struct!(generate_default $($default)?),
+                    $it: buffer_struct!(generate_default $($default)?),
                 )*}
             }
         }
@@ -175,7 +175,7 @@ macro_rules! ext4_struct {
         impl crate::serialization::CheckMagic for $name {
             fn check_magic(&self) -> std::io::Result<()> {
                 $(
-                    ext4_struct!(generate_check_magic self $it $($default)?);
+                    buffer_struct!(generate_check_magic self $it $($default)?);
                 )*
                 Ok(())
             }
@@ -194,7 +194,7 @@ macro_rules! ext4_struct {
     };
     (generate_check_magic $self:ident $it:ident) => { };
 }
-pub(crate) use ext4_struct;
+pub(crate) use buffer_struct;
 
 macro_rules! hi_lo_field_u64 {
     ($get_name:ident, $set_name:ident, $hi:ident, $lo:ident) => {
