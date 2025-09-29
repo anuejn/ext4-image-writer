@@ -461,27 +461,38 @@ impl<W: io::Write + io::Seek> Ext4ImageWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
-    #[test]
-    fn test_ext4_image_writer_minimal() {
-        let _ = std::fs::remove_file("target/minimal.img");
-        let file = std::fs::File::create("target/minimal.img").unwrap();
-        let writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024);
-        writer.finish().unwrap();
-        let process = std::process::Command::new("e2fsck")
-            .arg("-f")
-            .arg("-n")
-            .arg("target/minimal.img")
-            .output()
-            .unwrap();
-        assert!(process.status.success());
+    macro_rules! test_create_fs {
+        ($test_name:ident, |$writer:ident| $test_code:tt) => {
+            #[test]
+            fn $test_name() {
+                let file_name = format!("target/{}.img", stringify!($test_name));
+                let _ = std::fs::remove_file(&file_name);
+                let file = std::fs::File::create(&file_name).unwrap();
+                #[allow(unused_mut)]
+                let mut $writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
+                $test_code
+                $writer.finish().unwrap();
+                let (mut reader, writer) = std::io::pipe().unwrap();
+                let status = std::process::Command::new("e2fsck")
+                    .args(&["-fn", &file_name])
+                    .stdout(writer.try_clone().unwrap())
+                    .stderr(writer)
+                    .status()
+                    .unwrap();
+                if !status.success() {
+                    let mut output = String::new();
+                    reader.read_to_string(&mut output).unwrap();
+                    panic!("e2fsck failed: {}", output);
+                }
+            }
+        };
     }
 
-    #[test]
-    fn test_ext4_image_writer_many_files() {
-        let _ = std::fs::remove_file("target/many_files.img");
-        let file = std::fs::File::create("target/many_files.img").unwrap();
-        let mut writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
+    test_create_fs!(test_ext4_image_writer_minimal, |writer| {});
+
+    test_create_fs!(test_ext4_image_writer_many_files, |writer| {
         for i in 0..5000 {
             writer
                 .write_file(
@@ -491,68 +502,24 @@ mod tests {
                 )
                 .unwrap();
         }
-        writer.finish().unwrap();
-        let process = std::process::Command::new("e2fsck")
-            .arg("-f")
-            .arg("-n")
-            .arg("target/many_files.img")
-            .output()
-            .unwrap();
-        assert!(process.status.success());
-    }
+    });
 
-    #[test]
-    fn test_ext4_image_writer_zero_size_file() {
-        let _ = std::fs::remove_file("target/zero_size_file.img");
-        let file = std::fs::File::create("target/zero_size_file.img").unwrap();
-        let mut writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
+    test_create_fs!(test_ext4_image_writer_zero_size_file, |writer| {
         let zero_size_file = vec![];
         writer
             .write_file(&zero_size_file, "zero_size_file.bin", 0o644)
             .unwrap();
-        writer.finish().unwrap();
-        let process = std::process::Command::new("e2fsck")
-            .arg("-f")
-            .arg("-n")
-            .arg("target/zero_size_file.img")
-            .output()
-            .unwrap();
-        assert!(process.status.success());
-    }
+    });
 
-    #[test]
-    fn test_ext4_image_writer_big_file() {
-        let _ = std::fs::remove_file("target/big_file.img");
-        let file = std::fs::File::create("target/big_file.img").unwrap();
-        let mut writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
+    test_create_fs!(test_ext4_image_writer_big_file, |writer| {
         let big_file = vec![0xABu8; 1024 * 1024 * 1024];
         writer.write_file(&big_file, "big-file.bin", 0o644).unwrap();
-        writer.finish().unwrap();
-        let process = std::process::Command::new("e2fsck")
-            .arg("-f")
-            .arg("-n")
-            .arg("target/big_file.img")
-            .output()
-            .unwrap();
-        assert!(process.status.success());
-    }
+    });
 
-    #[test]
-    fn test_ext4_image_writer_inline_dirs() {
-        let _ = std::fs::remove_file("target/inline_dirs.img");
-        let file = std::fs::File::create("target/inline_dirs.img").unwrap();
-        let mut writer = Ext4ImageWriter::new(file, 1024 * 1024 * 1024 * 128);
+    test_create_fs!(test_ext4_image_writer_inline_dirs, |writer| {
         writer.mkdir("dir").unwrap();
         writer.write_file(&[], "dir/longer_entry", 0o755).unwrap();
         writer.write_file(&[], "dir/short_entry", 0o755).unwrap();
         writer.write_file(&[], "dir/over_the_edge", 0o755).unwrap();
-        writer.finish().unwrap();
-        let process = std::process::Command::new("e2fsck")
-            .arg("-f")
-            .arg("-n")
-            .arg("target/inline_dirs.img")
-            .output()
-            .unwrap();
-        assert!(process.status.success());
-    }
+    });
 }
